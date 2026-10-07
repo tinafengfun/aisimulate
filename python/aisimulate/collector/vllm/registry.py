@@ -236,6 +236,13 @@ REGISTRY_XPU: list[OpEntry] = [
         perf_filename=PerfFile.DSA_GENERATION_MODULE,
     ),
     OpEntry(
+        op="mhc_module",
+        module="collector.vllm.collect_mhc_module_xpu",
+        get_func="get_mhc_module_test_cases",
+        run_func="run_mhc_module_worker",
+        perf_filename=PerfFile.MHC_MODULE,
+    ),
+    OpEntry(
         op="gdn",
         module="collector.vllm.collect_gdn_xpu",
         get_func="get_gdn_test_cases",

@@ -13,11 +13,15 @@ import copy
 import dataclasses
 import functools
 import itertools
+import logging
 import os
 from pathlib import Path
 from typing import Optional
 
 import yaml
+
+
+logger = logging.getLogger(__name__)
 
 
 def _xpu_available() -> bool:
@@ -2191,6 +2195,60 @@ def get_common_mhc_test_cases() -> list[MhcCommonTestCase]:
                 )
             )
     return test_cases
+
+
+def get_xpu_mhc_module_test_cases() -> list[dict]:
+    """Curated vLLM-XPU mHC pre/post module cases (DeepSeek-V4 family).
+
+    The token sweep comes from ``common_case_values.mhc.token_counts`` and the
+    per-model geometry (hidden_size + hc_mult) from
+    ``common_case_values.mhc.xpu.models``. Returns dicts matching
+    ``run_mhc_module_worker``: ``params = [phase, num_tokens, hidden_size, hc_mult]``.
+
+    Cases whose residual element count ``num_tokens * hc_mult * hidden_size``
+    reaches 2**32 are pruned: the deepklox XE3P mHC kernels index that buffer
+    with a 32-bit element offset, so a count of 2**32 or more overflows and
+    wedges the device (UR_RESULT_ERROR_DEVICE_LOST) well below any memory
+    limit. Set ``MHC_SKIP_OVERFLOW_CASES=0`` to force-emit them (e.g. to
+    re-verify after a deepklox kernel fix).
+    """
+    mhc_sweep = _required_base_common_case_values("mhc")
+    num_tokens_list = _as_int_list(mhc_sweep.get("token_counts"), field_name="mhc.token_counts")
+
+    xpu = _required_mapping(mhc_sweep.get("xpu"), field_name="mhc.xpu")
+    hc_mult = int(xpu["hc_mult"])
+    models = xpu.get("models")
+    if not isinstance(models, list):
+        raise TypeError("common_case_values.mhc.xpu.models must be a list")
+
+    skip_overflow = os.environ.get("MHC_SKIP_OVERFLOW_CASES", "1").lower() not in {"0", "false", "no"}
+    overflow_elems = 2**32
+
+    cases: list[dict] = []
+    for model_config in models:
+        if not isinstance(model_config, dict):
+            raise TypeError("common_case_values.mhc.xpu.models entries must be mappings")
+        hidden_size = int(model_config["hidden_size"])
+        for phase in ("pre", "post"):
+            for num_tokens in num_tokens_list:
+                if skip_overflow and num_tokens * hc_mult * hidden_size >= overflow_elems:
+                    logger.warning(
+                        "mHC skip %s hs%d hcm%d tokens=%d: residual elems %d >= 2**32 overflows the "
+                        "deepklox 32-bit offset (device-lost)",
+                        phase,
+                        hidden_size,
+                        hc_mult,
+                        num_tokens,
+                        num_tokens * hc_mult * hidden_size,
+                    )
+                    continue
+                cases.append(
+                    {
+                        "id": f"mhc_{phase}_hs{hidden_size}_hcm{hc_mult}_{num_tokens}",
+                        "params": [phase, num_tokens, hidden_size, hc_mult],
+                    }
+                )
+    return cases
 
 
 def get_common_gdn_test_cases() -> list[GdnCommonTestCase]:

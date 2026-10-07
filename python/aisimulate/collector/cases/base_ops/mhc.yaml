@@ -42,3 +42,12 @@ common_case_values:
     - 131072
     - 262144
     - 524288
+    xpu:
+      hc_mult: 4
+      models:
+      - model_path: deepseek-ai/DeepSeek-V4-Flash
+        hidden_size: 4096
+      - model_path: deepseek-ai/DeepSeek-V4-Pro
+        hidden_size: 7168
+      - model_path: deepseek-ai/DeepSeek-V4.1-Flash
+        hidden_size: 5120
