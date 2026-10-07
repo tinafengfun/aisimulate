@@ -225,8 +225,26 @@ collector.vllm.collect_kda:
   - collector/cases/base_ops/kda.yaml
   - __model_cases__
 collector.vllm.collect_dsv4_attn:
+  # Same closure shape as the trtllm entry above (PR #1486 review S3): the
+  # DSV4 case builders read the model-yaml dsv4 block AND the base-op budget
+  # declaration (caps + decode ladder), so a budget edit must move this hash.
+  - collector/cases/base_ops/dsv4_attention.yaml
+  - __model_cases__
+collector.vllm.collect_dsv4_attn_xpu:
+  # XPU DSV4 module/sparse collectors: get_funcs are re-exported from
+  # case_generator's XPU builders, which read the same dsv4 model grids and
+  # the shared base-op budgets as the CUDA collector (comparable-subset
+  # alignment), and utils_xpu.py supplies the construction/metadata toolkit.
+  - collector/cases/base_ops/dsv4_attention.yaml
+  - collector/vllm/utils_xpu.py
   - __model_cases__
 collector.vllm.collect_gdn:
+  - collector/cases/base_ops/gdn.yaml
+  - __model_cases__
+collector.vllm.collect_gdn_xpu:
+  # Same case reads as the CUDA gdn collector (get_gdn_test_cases is shared
+  # case_generator code reading gdn.yaml + model cases); this entry was
+  # missing and made load_closures fail closed on enumerate_provenance_modules.
   - collector/cases/base_ops/gdn.yaml
   - __model_cases__
 collector.vllm.collect_gemm:

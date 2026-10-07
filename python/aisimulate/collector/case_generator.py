@@ -14,6 +14,7 @@ import dataclasses
 import functools
 import itertools
 import os
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -2853,6 +2854,160 @@ def get_dsv4_csa_attn_test_cases():
     (csa_attn is the CSA sparse FMLA over the topk-selected c4 positions),
     1:1 with the csa-module rows — same source as paged_mqa_logits/topk."""
     return [[model_path, "csa_attn"] for model_path in _selected_dsv4_models()]
+
+
+# ----------------------------------------------------------------------
+# XPU (CRI) DSV4 case builders
+#
+# collector/vllm/collect_dsv4_attn_xpu.py re-exports these as its OpEntry
+# get_func names (collect.py resolves get_func AND run_func from the entry's
+# own module). Row format is the vLLM per-shape convention of
+# collector/vllm/collect_dsv4_attn.py run_dsv4_attn_worker /
+# run_dsv4_sparse_kernel_worker — NOT the sglang one-case-per-model shape of
+# _build_dsv4_module_test_cases above, whose workers derive shapes from the
+# module CSV.
+#
+# Grids, budgets and models are shared with the CUDA collector on purpose:
+# NV↔XPU alignment (check_cross_backend.py) needs a comparable subset, and the
+# audited XPU quant path (XPUFp8BlockScaledMMKernel) is the same sgl-project
+# FP8 artifact set as the CUDA defaults.
+# ----------------------------------------------------------------------
+
+_DSV4_XPU_CONTEXT_PREFIX_ANCHORS = (0, 128, 2048, 4096)
+_DSV4_XPU_MAX_SPARSE_QUERY_TOKENS = int(
+    os.environ.get("AIC_VLLM_DSV4_SPARSE_MAX_QUERY_TOKENS", "8192")
+)
+
+
+def _xpu_dsv4_max_seq_len() -> int:
+    # Mirrors collect_dsv4_attn.py MAX_SEQ_LEN (same env override), sourced
+    # from the declared base-op budget instead of a module constant.
+    return int(os.environ.get("AIC_VLLM_DSV4_MAX_SEQ_LEN", str(_DSV4_MODULE_BUDGETS["max_seq_len"])))
+
+
+def _xpu_dsv4_module_shapes(
+    mode: str,
+    batch_sizes,
+    seq_lens,
+    prefix_anchors= _DSV4_XPU_CONTEXT_PREFIX_ANCHORS,
+    include_dynamic_endpoint: bool = True,
+) -> list[tuple[int, int, int]]:
+    """Enumerate (batch_size, seq_len, prefix_len) module shapes.
+
+    Same budgets as the CUDA collector's _vllm_dsv4_attention_filter_shapes,
+    read from the declared dsv4_module_budgets (decode ladder included).
+    """
+    budgets = _DSV4_MODULE_BUDGETS
+    max_seq_len = _xpu_dsv4_max_seq_len()
+    max_context_query_tokens = budgets["max_context_query_tokens"]
+    max_generation_kv_tokens = budgets["max_generation_kv_tokens"]
+    is_context = mode == "context"
+    shapes = []
+    for bs in batch_sizes:
+        for sl in seq_lens:
+            if sl > max_seq_len:
+                continue
+            if is_context:
+                prefixes = (*prefix_anchors, max_seq_len - sl) if include_dynamic_endpoint else prefix_anchors
+                prefixes = dict.fromkeys(prefixes)
+                for prefix_len in prefixes:
+                    total_seq_len = prefix_len + sl
+                    if prefix_len < 0 or total_seq_len > max_seq_len:
+                        continue
+                    if bs * sl > max_context_query_tokens:
+                        continue
+                    if bs * total_seq_len > max_generation_kv_tokens:
+                        continue
+                    shapes.append((bs, sl, prefix_len))
+            else:
+                if bs * sl > max_generation_kv_tokens:
+                    continue
+                # decode batch ladder (declared in dsv4_module_budgets)
+                for floor, max_bs in budgets["decode_batch_ladder"]:
+                    if sl >= floor and bs > max_bs:
+                        break
+                else:
+                    shapes.append((bs, sl, 0))
+    return shapes
+
+
+def _xpu_dsv4_module_rows(mode: str, attn_kind: str) -> list[list]:
+    model_paths = _selected_dsv4_models()
+    if not model_paths:
+        return []
+    smoke = "--smoke" in sys.argv
+    seq_lens = [64] if smoke else list(_DSV4_MODULE_SEQ_LENGTHS)
+    prefix_anchors = (0, 128) if smoke else _DSV4_XPU_CONTEXT_PREFIX_ANCHORS
+    shapes = _xpu_dsv4_module_shapes(
+        mode,
+        _DSV4_MODULE_BATCH_SIZES,
+        seq_lens,
+        prefix_anchors,
+        include_dynamic_endpoint=not smoke,
+    )
+    return [
+        [seq_len, batch_size, tp_size, "fp8", "bfloat16", "fp8_block", model_path, attn_kind, None]
+        + ([prefix_len] if mode == "context" else [])
+        for model_path in model_paths
+        for tp_size in _DSV4_MODULE_TP_SIZES
+        for batch_size, seq_len, prefix_len in shapes
+    ]
+
+
+def _xpu_dsv4_sparse_rows(kernel: str) -> list[list]:
+    if kernel not in DSV4_SPARSE_KERNELS:
+        raise ValueError(f"unknown sparse kernel={kernel}")
+    model_paths = _selected_dsv4_models()
+    if not model_paths:
+        return []
+
+    tp_list = _DSV4_SPARSE_TP_LIST_ATTN if kernel == "hca_attn" else _DSV4_SPARSE_TP_LIST_INDEXER
+    if "--smoke" in sys.argv:
+        smoke_shapes = [
+            (1, 1, 8192),
+            (1, 64, 8192),
+        ]
+        return [
+            [bs, isl, past_kv, 1, kernel, model_path] for model_path in model_paths for bs, isl, past_kv in smoke_shapes
+        ]
+
+    cases: list[list] = []
+    for model_path in model_paths:
+        for tp_size in tp_list:
+            for bs in _DSV4_SPARSE_BS_LIST:
+                for isl in _DSV4_SPARSE_ISL_LIST:
+                    if bs * isl > _DSV4_XPU_MAX_SPARSE_QUERY_TOKENS:
+                        continue
+                    for past_kv in _DSV4_SPARSE_PAST_KV_LIST:
+                        full_s = isl + past_kv
+                        if bs * full_s > _DSV4_SPARSE_MAX_FULL_S:
+                            continue
+                        cases.append([bs, isl, past_kv, tp_size, kernel, model_path])
+    return cases
+
+
+def get_xpu_dsv4_csa_context_test_cases():
+    return _xpu_dsv4_module_rows("context", "csa")
+
+
+def get_xpu_dsv4_hca_context_test_cases():
+    return _xpu_dsv4_module_rows("context", "hca")
+
+
+def get_xpu_dsv4_csa_generation_test_cases():
+    return _xpu_dsv4_module_rows("generation", "csa")
+
+
+def get_xpu_dsv4_hca_generation_test_cases():
+    return _xpu_dsv4_module_rows("generation", "hca")
+
+
+def get_xpu_dsv4_paged_mqa_logits_test_cases():
+    return _xpu_dsv4_sparse_rows("paged_mqa_logits")
+
+
+def get_xpu_dsv4_hca_attn_test_cases():
+    return _xpu_dsv4_sparse_rows("hca_attn")
 
 
 # Backward-compatible names for older PR comments/tests while the registry and

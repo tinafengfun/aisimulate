@@ -228,4 +228,51 @@ REGISTRY_XPU: list[OpEntry] = [
         run_func="run_gdn_torch",
         perf_filename=PerfFile.GDN,
     ),
+    # DSV4 attention (XPU port of collect_dsv4_attn). Op/get/run names are
+    # identical to the CUDA entries above; only the module differs. The get
+    # funcs are re-exported from case_generator's XPU builders, which use the
+    # vLLM per-shape row convention (the sglang-named get_dsv4_* functions in
+    # case_generator are a different, one-case-per-model convention).
+    OpEntry(
+        op="dsv4_csa_context_module",
+        module="collector.vllm.collect_dsv4_attn_xpu",
+        get_func="get_dsv4_csa_context_test_cases",
+        run_func="run_dsv4_attn_worker",
+        perf_filename=PerfFile.DSV4_CSA_CONTEXT_MODULE,
+    ),
+    OpEntry(
+        op="dsv4_hca_context_module",
+        module="collector.vllm.collect_dsv4_attn_xpu",
+        get_func="get_dsv4_hca_context_test_cases",
+        run_func="run_dsv4_attn_worker",
+        perf_filename=PerfFile.DSV4_HCA_CONTEXT_MODULE,
+    ),
+    OpEntry(
+        op="dsv4_csa_generation_module",
+        module="collector.vllm.collect_dsv4_attn_xpu",
+        get_func="get_dsv4_csa_generation_test_cases",
+        run_func="run_dsv4_attn_worker",
+        perf_filename=PerfFile.DSV4_CSA_GENERATION_MODULE,
+    ),
+    OpEntry(
+        op="dsv4_hca_generation_module",
+        module="collector.vllm.collect_dsv4_attn_xpu",
+        get_func="get_dsv4_hca_generation_test_cases",
+        run_func="run_dsv4_attn_worker",
+        perf_filename=PerfFile.DSV4_HCA_GENERATION_MODULE,
+    ),
+    OpEntry(
+        op="dsv4_paged_mqa_logits_module",
+        module="collector.vllm.collect_dsv4_attn_xpu",
+        get_func="get_dsv4_paged_mqa_logits_test_cases",
+        run_func="run_dsv4_sparse_kernel_worker",
+        perf_filename=PerfFile.DSV4_PAGED_MQA_LOGITS_MODULE,
+    ),
+    OpEntry(
+        op="dsv4_hca_attn_module",
+        module="collector.vllm.collect_dsv4_attn_xpu",
+        get_func="get_dsv4_hca_attn_test_cases",
+        run_func="run_dsv4_sparse_kernel_worker",
+        perf_filename=PerfFile.DSV4_HCA_ATTN_MODULE,
+    ),
 ]
