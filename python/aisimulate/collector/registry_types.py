@@ -67,6 +67,11 @@ class PerfFile(str, Enum):
     DSV4_HCA_CONTEXT_MODULE = "dsv4_hca_context_module_perf.txt"
     DSV4_CSA_GENERATION_MODULE = "dsv4_csa_generation_module_perf.txt"
     DSV4_HCA_GENERATION_MODULE = "dsv4_hca_generation_module_perf.txt"
+    # DeepSeek-V4 sliding-window-only layers (compress_ratios == 0, window 128;
+    # the first two V4-Flash / V4.1-Flash layers — serving clamps max(1, ratio)
+    # and routes them through the swa_only branch of DeepseekV4XPUAttention).
+    DSV4_SWA_CONTEXT_MODULE = "dsv4_swa_context_module_perf.txt"
+    DSV4_SWA_GENERATION_MODULE = "dsv4_swa_generation_module_perf.txt"
     # DeepSeek-V4 sparse-kernel data — bench-collected (paged_mqa_logits +
     # hca_attn + csa_attn), each 1:1 with its owning CSA/HCA module rows.
     DSV4_PAGED_MQA_LOGITS_MODULE = "dsv4_paged_mqa_logits_module_perf.txt"

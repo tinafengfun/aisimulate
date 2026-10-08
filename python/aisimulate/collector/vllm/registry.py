@@ -233,12 +233,26 @@ REGISTRY_XPU: list[OpEntry] = [
     # funcs are re-exported from case_generator's XPU builders, which use the
     # vLLM per-shape row convention (the sglang-named get_dsv4_* functions in
     # case_generator are a different, one-case-per-model convention).
+    #
+    # The swa kind covers the pure sliding-window layers (compress_ratios == 0,
+    # clamped to 1 by serving) of V4-Flash / V4.1-Flash. Unlike the reference
+    # implementation this merged from, the sparse-kernel ops below
+    # (dsv4_paged_mqa_logits_module / dsv4_hca_attn_module) are RETAINED — they
+    # are on the required-op list of the DSV4 collector task and have no swa
+    # equivalent.
     OpEntry(
         op="dsv4_csa_context_module",
         module="collector.vllm.collect_dsv4_attn_xpu",
         get_func="get_dsv4_csa_context_test_cases",
         run_func="run_dsv4_attn_worker",
         perf_filename=PerfFile.DSV4_CSA_CONTEXT_MODULE,
+    ),
+    OpEntry(
+        op="dsv4_swa_context_module",
+        module="collector.vllm.collect_dsv4_attn_xpu",
+        get_func="get_dsv4_swa_context_test_cases",
+        run_func="run_dsv4_attn_worker",
+        perf_filename=PerfFile.DSV4_SWA_CONTEXT_MODULE,
     ),
     OpEntry(
         op="dsv4_hca_context_module",
@@ -260,6 +274,13 @@ REGISTRY_XPU: list[OpEntry] = [
         get_func="get_dsv4_hca_generation_test_cases",
         run_func="run_dsv4_attn_worker",
         perf_filename=PerfFile.DSV4_HCA_GENERATION_MODULE,
+    ),
+    OpEntry(
+        op="dsv4_swa_generation_module",
+        module="collector.vllm.collect_dsv4_attn_xpu",
+        get_func="get_dsv4_swa_generation_test_cases",
+        run_func="run_dsv4_attn_worker",
+        perf_filename=PerfFile.DSV4_SWA_GENERATION_MODULE,
     ),
     OpEntry(
         op="dsv4_paged_mqa_logits_module",

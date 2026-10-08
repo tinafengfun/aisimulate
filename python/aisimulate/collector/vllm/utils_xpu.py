@@ -14,6 +14,7 @@ and backend compatibility shims used by the XPU collectors.
 import functools
 import inspect
 import os
+import socket
 from contextlib import ExitStack
 from dataclasses import dataclass
 from functools import wraps
@@ -242,6 +243,7 @@ def create_vllm_config(
     head_dim: int | None = None,
     num_heads: int | None = None,
     num_kv_heads: int | None = None,
+    quantization: str | None = None,
 ) -> VllmConfig:
     """Create a VllmConfig for testing with reasonable defaults."""
 
@@ -252,6 +254,7 @@ def create_vllm_config(
         dtype=dtype,
         seed=0,
         max_model_len=max_model_len,
+        quantization=quantization,
     )
 
     try:
@@ -614,12 +617,16 @@ def create_and_prepopulate_kv_cache(
 
 @functools.cache  # only run once per process
 def setup_distributed(device):
-    # Each process needs to use a different port. Bare device strings
-    # ("xpu"/"cuda") carry no ordinal, so default to device 0.
+    # Bare device strings ("xpu"/"cuda") carry no ordinal, so default to device 0.
     device_idx = torch.device(device).index
     if device_idx is None:
         device_idx = 0
-    port = 8889 + device_idx
+    # world_size=1, so any free port works; fixed 8889+idx ports collide on
+    # shared hosts (orphaned workers from killed runs hold the port and make
+    # distributed init fail with DistNetworkError/EADDRINUSE).
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("", 0))  # all interfaces, like the TCPStore listener
+        port = sock.getsockname()[1]
     print(device, device_idx, port)
 
     os.environ["RANK"] = "0"

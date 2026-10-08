@@ -2867,91 +2867,71 @@ def get_dsv4_csa_attn_test_cases():
 # _build_dsv4_module_test_cases above, whose workers derive shapes from the
 # module CSV.
 #
-# Grids, budgets and models are shared with the CUDA collector on purpose:
-# NV↔XPU alignment (check_cross_backend.py) needs a comparable subset, and the
-# audited XPU quant path (XPUFp8BlockScaledMMKernel) is the same sgl-project
-# FP8 artifact set as the CUDA defaults.
+# Module-op grids live in `common_case_values.dsv4_xpu_attention` (base_ops/
+# dsv4_attention.yaml) and are swept per attn_kind/mode by the single builder
+# below. gemm_type is mxfp8 only: on XPU the checkpoint's 128x128 fp8_block
+# scales send the o_proj wo_a bmm to oneDNN's reference implementation (not a
+# serving path); mxfp8 (1x32/E8M0, online quantization) is what the XPU o_proj
+# quantizes for. NV↔XPU alignment on the fp8_block axis therefore records a
+# declared XPU-side coverage gap (see dsv4_xpu_attention comments in the yaml).
 # ----------------------------------------------------------------------
 
-_DSV4_XPU_CONTEXT_PREFIX_ANCHORS = (0, 128, 2048, 4096)
-_DSV4_XPU_MAX_SPARSE_QUERY_TOKENS = int(
-    os.environ.get("AIC_VLLM_DSV4_SPARSE_MAX_QUERY_TOKENS", "8192")
-)
 
+def get_xpu_dsv4_attn_test_cases(attn_kind: str, mode: str) -> list[list]:
+    """DSV4 attention-module cases for the vLLM-XPU (CRI) collector.
 
-def _xpu_dsv4_max_seq_len() -> int:
-    # Mirrors collect_dsv4_attn.py MAX_SEQ_LEN (same env override), sourced
-    # from the declared base-op budget instead of a module constant.
-    return int(os.environ.get("AIC_VLLM_DSV4_MAX_SEQ_LEN", str(_DSV4_MODULE_BUDGETS["max_seq_len"])))
+    Sweeps the grids under ``common_case_values.dsv4_xpu_attention`` (base_ops/
+    dsv4_attention.yaml). One case per shape, laid out as
+    ``run_dsv4_attn_worker``'s positional args::
 
-
-def _xpu_dsv4_module_shapes(
-    mode: str,
-    batch_sizes,
-    seq_lens,
-    prefix_anchors= _DSV4_XPU_CONTEXT_PREFIX_ANCHORS,
-    include_dynamic_endpoint: bool = True,
-) -> list[tuple[int, int, int]]:
-    """Enumerate (batch_size, seq_len, prefix_len) module shapes.
-
-    Same budgets as the CUDA collector's _vllm_dsv4_attention_filter_shapes,
-    read from the declared dsv4_module_budgets (decode ladder included).
+        [seq_len, batch_size, tp_size, "fp8", "bfloat16", gemm_type, model_path,
+         attn_kind, None, (prefix_len — context only)]
     """
-    budgets = _DSV4_MODULE_BUDGETS
-    max_seq_len = _xpu_dsv4_max_seq_len()
-    max_context_query_tokens = budgets["max_context_query_tokens"]
-    max_generation_kv_tokens = budgets["max_generation_kv_tokens"]
-    is_context = mode == "context"
-    shapes = []
-    for bs in batch_sizes:
-        for sl in seq_lens:
-            if sl > max_seq_len:
-                continue
-            if is_context:
-                prefixes = (*prefix_anchors, max_seq_len - sl) if include_dynamic_endpoint else prefix_anchors
-                prefixes = dict.fromkeys(prefixes)
-                for prefix_len in prefixes:
-                    total_seq_len = prefix_len + sl
-                    if prefix_len < 0 or total_seq_len > max_seq_len:
-                        continue
-                    if bs * sl > max_context_query_tokens:
-                        continue
-                    if bs * total_seq_len > max_generation_kv_tokens:
-                        continue
-                    shapes.append((bs, sl, prefix_len))
-            else:
-                if bs * sl > max_generation_kv_tokens:
-                    continue
-                # decode batch ladder (declared in dsv4_module_budgets)
-                for floor, max_bs in budgets["decode_batch_ladder"]:
-                    if sl >= floor and bs > max_bs:
-                        break
-                else:
-                    shapes.append((bs, sl, 0))
-    return shapes
-
-
-def _xpu_dsv4_module_rows(mode: str, attn_kind: str) -> list[list]:
-    model_paths = _selected_dsv4_models()
-    if not model_paths:
-        return []
+    if mode not in ("context", "generation"):
+        raise ValueError(f"unsupported DeepSeek-V4 mode: {mode}")
+    grids = _required_base_common_case_values("dsv4_xpu_attention").get("grids")
+    if not isinstance(grids, list):
+        raise TypeError("common_case_values.dsv4_xpu_attention.grids must be a list")
+    model_filter = _get_model_path_filter()
+    # --smoke is a runtime concern (case_authoring.md): shrink to the smoke
+    # shapes the module smoke regression has always run, keeping every other
+    # grid field (tp sizes, gemm types, models, budgets) as declared.
     smoke = "--smoke" in sys.argv
-    seq_lens = [64] if smoke else list(_DSV4_MODULE_SEQ_LENGTHS)
-    prefix_anchors = (0, 128) if smoke else _DSV4_XPU_CONTEXT_PREFIX_ANCHORS
-    shapes = _xpu_dsv4_module_shapes(
-        mode,
-        _DSV4_MODULE_BATCH_SIZES,
-        seq_lens,
-        prefix_anchors,
-        include_dynamic_endpoint=not smoke,
-    )
-    return [
-        [seq_len, batch_size, tp_size, "fp8", "bfloat16", "fp8_block", model_path, attn_kind, None]
-        + ([prefix_len] if mode == "context" else [])
-        for model_path in model_paths
-        for tp_size in _DSV4_MODULE_TP_SIZES
-        for batch_size, seq_len, prefix_len in shapes
-    ]
+
+    cases: list[list] = []
+    for index, grid in enumerate(grids):
+        grid = _required_mapping(grid, field_name=f"dsv4_xpu_attention.grids[{index}]")
+        if attn_kind not in _as_str_list(grid["attn_kinds"], field_name="attn_kinds"):
+            continue
+        max_batch_tokens = int(grid["max_batch_tokens"])
+        if mode == "context":
+            batch_sizes = _as_int_list(grid["context_batch_sizes"], field_name="context_batch_sizes")
+            seq_lens = [64] if smoke else _as_int_list(
+                grid["context_sequence_lengths"], field_name="context_sequence_lengths"
+            )
+            prefix_lens = [0, 128] if smoke else _as_int_list(
+                grid["context_prefix_lengths"], field_name="context_prefix_lengths"
+            )
+        else:
+            batch_sizes = _as_int_list(grid["generation_batch_sizes"], field_name="generation_batch_sizes")
+            seq_lens = [64] if smoke else _as_int_list(grid["generation_steps"], field_name="generation_steps")
+            prefix_lens = [0]
+        for model_path in _as_str_list(grid["model_paths"], field_name="model_paths"):
+            if model_filter is not None and model_filter != model_path:
+                continue
+            for gemm_type in _as_str_list(grid["gemm_types"], field_name="gemm_types"):
+                for tp_size in _as_int_list(grid["tp_sizes"], field_name="tp_sizes"):
+                    for batch_size in batch_sizes:
+                        for seq_len in seq_lens:
+                            for prefix_len in prefix_lens:
+                                if batch_size * (prefix_len + seq_len) > max_batch_tokens:
+                                    continue
+                                case = [seq_len, batch_size, tp_size, "fp8", "bfloat16", gemm_type]
+                                case += [model_path, attn_kind, None]
+                                if mode == "context":
+                                    case.append(prefix_len)
+                                cases.append(case)
+    return cases
 
 
 def _xpu_dsv4_sparse_rows(kernel: str) -> list[list]:
@@ -2987,19 +2967,27 @@ def _xpu_dsv4_sparse_rows(kernel: str) -> list[list]:
 
 
 def get_xpu_dsv4_csa_context_test_cases():
-    return _xpu_dsv4_module_rows("context", "csa")
+    return get_xpu_dsv4_attn_test_cases("csa", "context")
 
 
 def get_xpu_dsv4_hca_context_test_cases():
-    return _xpu_dsv4_module_rows("context", "hca")
+    return get_xpu_dsv4_attn_test_cases("hca", "context")
+
+
+def get_xpu_dsv4_swa_context_test_cases():
+    return get_xpu_dsv4_attn_test_cases("swa", "context")
 
 
 def get_xpu_dsv4_csa_generation_test_cases():
-    return _xpu_dsv4_module_rows("generation", "csa")
+    return get_xpu_dsv4_attn_test_cases("csa", "generation")
 
 
 def get_xpu_dsv4_hca_generation_test_cases():
-    return _xpu_dsv4_module_rows("generation", "hca")
+    return get_xpu_dsv4_attn_test_cases("hca", "generation")
+
+
+def get_xpu_dsv4_swa_generation_test_cases():
+    return get_xpu_dsv4_attn_test_cases("swa", "generation")
 
 
 def get_xpu_dsv4_paged_mqa_logits_test_cases():

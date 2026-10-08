@@ -1477,6 +1477,11 @@ def _is_cuda_fatal_exception(exc, torch_mod) -> bool:
             "cublas_status_execution_failed",
             "cublas_status_internal_error",
             "cublas_status_alloc_failed",
+            # XPU (Level Zero): a lost device fails every later task in the same
+            # process, so the worker must exit and be restarted instead of
+            # turning one real failure into a run-full-of-failures.
+            "ur_result_error_device_lost",
+            "ur_result_error_out_of_device_memory",
         )
         is_cuda_fatal = any(marker in error_text for marker in fatal_markers)
     if not is_cuda_fatal:
@@ -2541,12 +2546,14 @@ def _all_op_names() -> list[str]:
     from collector.sglang.registry import REGISTRY as SGLANG_REG
     from collector.trtllm.registry import REGISTRY as TRTLLM_REG
     from collector.vllm.registry import REGISTRY as VLLM_REG
+    from collector.vllm.registry import REGISTRY_XPU as VLLM_XPU_REG
 
     seen = set()
     ops = []
     registries = [
         TRTLLM_REG,
         VLLM_REG,
+        VLLM_XPU_REG,
         SGLANG_REG,
         _wideep_registry_for_backend("trtllm"),
         _wideep_registry_for_backend("vllm"),
