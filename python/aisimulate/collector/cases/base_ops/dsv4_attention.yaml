@@ -24,3 +24,41 @@ common_case_values:
     - [65536, 8]
     - [32768, 16]
     - [8192, 64]
+  # vLLM-XPU (CRI) DSV4 attention-module grids. See get_xpu_dsv4_attn_test_cases.
+  # max_batch_tokens bounds batch * (prefix + isl) for context, batch * step for
+  # generation. No bfloat16: the vLLM DSV4 o_proj always runs the fp8 wo_a bmm.
+  # mxfp8 = the 1x32/E8M0 weight granularity the XPU o_proj quantizes for (the
+  # checkpoint's 128x128 fp8_block scales send wo_a to oneDNN's reference bmm,
+  # which is not a serving path — so NV↔XPU alignment on the fp8_block axis is
+  # a declared XPU-side coverage gap, not a collection target).
+  # csa/hca context_prefix_lengths keep the XPU collector's prefix-reuse
+  # anchors (0/128/2048/4096); swa has no prefix axis (the 128-token window
+  # makes any prefix beyond it invisible).
+  dsv4_xpu_attention:
+    grids:
+    - attn_kinds: [csa, hca]
+      model_paths:
+      - deepseek-ai/DeepSeek-V4-Flash
+      - deepseek-ai/DeepSeek-V4-Pro
+      gemm_types: [mxfp8]
+      tp_sizes: [1, 2, 4, 8]
+      context_batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+      context_sequence_lengths: [1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 3072, 4096, 6144, 8192]
+      context_prefix_lengths: [0, 128, 2048, 4096]
+      generation_batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+      generation_steps: [1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 10240,
+        12288, 16384, 32768, 65536, 131072, 262144, 524288, 1048575]
+      max_batch_tokens: 1048576
+    # Sliding-window-only layers (compress_ratios == 0, window 128) of V4-Flash / V4.1-Flash.
+    - attn_kinds: [swa]
+      model_paths:
+      - deepseek-ai/DeepSeek-V4-Flash
+      - deepseek-ai/DeepSeek-V4.1-Flash
+      gemm_types: [mxfp8]
+      tp_sizes: [1, 2, 4, 8]
+      context_batch_sizes: [1, 4, 16, 64]
+      context_sequence_lengths: [3072, 16384, 76800, 102400]
+      context_prefix_lengths: [0]
+      generation_batch_sizes: [1, 16, 64, 256]
+      generation_steps: [127]
+      max_batch_tokens: 1048576

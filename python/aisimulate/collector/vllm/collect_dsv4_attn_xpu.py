@@ -4,8 +4,26 @@
 """DeepSeek-V4 module-level attention collector for vLLM on Intel XPU (CRI).
 
 XPU port of ``collect_dsv4_attn.py`` (the CUDA baseline is authoritative for
-op semantics and row shape and is deliberately not modified). The audited
-deltas from the CUDA collector are:
+op semantics and row shape and is deliberately not modified). Covers the
+CSA / HCA / SWA attention kinds: csa=4, hca=128, swa=0 (pure sliding window —
+the first two V4-Flash / V4.1-Flash layers, whose ``compress_ratios`` entry is
+0 and which serving clamps via ``max(1, ratio)`` into the ``swa_only`` branch
+of ``DeepseekV4XPUAttention``, xpu_sparse.py:145/169). vLLM-XPU has no
+DeepSeek-V4.1 model path; a V4.1 SWA layer is structurally a V4 SWA layer, so
+it is built as ``DeepseekV4XPUAttention`` from V4.1's ``text_config``.
+
+vLLM-XPU builds every DSV4 decoder layer's attention as
+``DeepseekV4XPUAttention`` (vllm/models/deepseek_v4/xpu/model.py), so the
+collector constructs that class for one layer, binds the DSV4
+main/SWA/indexer/compressor-state metadata and KV caches through the
+production builders, and benchmarks the full attention wrapper forward
+``attn(positions, hidden_states, None)`` (input projections, compressor +
+indexer, sparse MLA, inverse-RoPE + fp8 ``wo_a`` bmm + ``wo_b``). Sparse HCA
+is also isolated from that module. Paged MQA logits is collected as a
+kernel-level benchmark with directly constructed deepklox inputs, matching the
+sparse correction model.
+
+The audited deltas from the CUDA collector are:
 
 * F1 — the XPU worker's process-level ``torch.cuda → torch.xpu`` aliasing
   (``_torch_cuda_wrapper``, xpu_model_runner.py:315-337) is replicated from
@@ -30,11 +48,26 @@ deltas from the CUDA collector are:
   there; ``[B,1]`` raises) with the scheduler metadata sized by the device's
   EU count instead of the NV SM-count translation.
 
-Full CSA/HCA attention constructs one ``DeepseekV4XPUAttention`` layer, binds
-the DSV4 main/SWA/indexer/compressor metadata and KV caches, then benchmarks
-the full attention wrapper forward. Sparse HCA is also isolated from that
-module. Paged MQA logits is collected as a kernel-level benchmark with
-directly constructed deepklox inputs, matching the sparse correction model.
+gemm_type: ``mxfp8`` = online MXFP8 linears (``--quantization mxfp8`` ->
+``XPUMxFp8LinearKernel``), the 1x32/E8M0 granularity the XPU ``_o_proj``
+bmm expects (``deepseek_inv_rope_fp8_quant(use_mxfp8=True)`` +
+``xpu_fp8_bmm``); the checkpoint's 128x128 ``fp8_block`` scales send ``wo_a``
+to oneDNN's reference bmm, which is not a serving path — the XPU grids
+therefore collect mxfp8 only (NV↔XPU alignment on the fp8_block axis is a
+declared XPU-side coverage gap).
+
+Timing follows the V1 model runner's own dispatch (``VLLM_USE_V2_MODEL_RUNNER=0``)
+with ``VLLM_XPU_ENABLE_XPU_GRAPH=1``: batches within
+``AIC_VLLM_DSV4_MAX_CUDAGRAPH_CAPTURE_SIZE`` tokens (default 256 = vLLM's
+``2 * --max-num-seqs`` for the CRI recipe's 128) replay a graph, larger ones
+run eagerly. Decode replays a FULL graph whose metadata is built like the
+runner's capture (``max_seq_len = max_model_len``, which pins the C128A top-k
+width and the indexer top-k bound to the serving context limit for every
+replay), packed ``_decode_pack_n`` forwards per replay. Prefill replays a
+breakable PIECEWISE graph (graphed input/output projections around the eager
+``_prepare_and_attn_eager`` region) once per forward — serving pays one
+piecewise replay per layer, so no further packing. ``AIC_DSV4_PREFILL_TIMING``
+retains the eager investigation modes from the four-quadrant experiment.
 
 The attention path uses dummy weights. With dummy FP8 block weights, vLLM's
 DeepGEMM path may require real checkpoint layouts/scales to be representative;
@@ -64,24 +97,37 @@ if str(REPO_ROOT) not in sys.path:
 # deepklox, then the vllm_xpu_kernels extension that registers
 # torch.ops._xpu_C. Reversing the last two (torch → _xpu_C → deepklox)
 # segfaults the interpreter.
+#
+# VLLM_USE_BREAKABLE_CUDAGRAPH must be set before vLLM's DeepseekV4 attention
+# is imported: the piecewise prefill capture (_capture_breakable_graph) needs
+# the breakable-graph machinery registered at layer init, and serving runs
+# with it enabled (the eager-break region _prepare_and_attn_eager exists only
+# under it). setdefault keeps an explicit external setting authoritative.
+import os as _os_pre
+
+_os_pre.environ.setdefault("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+
 import torch
+import vllm.envs as vllm_envs
 from deepklox import fp8_fp4_paged_mqa_logits, get_paged_mqa_logits_metadata
 import vllm_xpu_kernels._xpu_C  # noqa: F401
+from vllm._xpu_ops import xpu_ops
+from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+from vllm.config import set_current_vllm_config
+from vllm.forward_context import set_forward_context
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.models.deepseek_v4.xpu.xpu_sparse import DeepseekV4XPUAttention
+from vllm.utils.torch_utils import set_default_torch_dtype
+from vllm.v1.worker.workspace import init_workspace_manager
 from vllm.version import __version__ as vllm_version
 
 from collector.case_generator import (
-    DSV4_ATTN_KINDS,
     DSV4_SPARSE_KERNELS,
     _DSV4_DEFAULT_MODELS,
     _DSV4_MODULE_TP_SIZES,
     _DSV4_SPARSE_MAX_FULL_S,
-    _DSV4_SPARSE_TP_LIST_ATTN,
-    _DSV4_SPARSE_TP_LIST_INDEXER,
-    get_xpu_dsv4_csa_context_test_cases,
-    get_xpu_dsv4_csa_generation_test_cases,
+    get_xpu_dsv4_attn_test_cases,
     get_xpu_dsv4_hca_attn_test_cases,
-    get_xpu_dsv4_hca_context_test_cases,
-    get_xpu_dsv4_hca_generation_test_cases,
     get_xpu_dsv4_paged_mqa_logits_test_cases,
 )
 from collector.helper import (
@@ -97,19 +143,25 @@ from collector.vllm.utils_xpu import (
     create_vllm_config,
     setup_distributed,
 )
-from vllm.config import set_current_vllm_config
-from vllm.forward_context import set_forward_context
-from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
-from vllm.models.deepseek_v4.xpu.xpu_sparse import DeepseekV4XPUAttention
-from vllm.utils.torch_utils import set_default_torch_dtype
-from vllm.v1.worker.workspace import init_workspace_manager
 
 __compat__ = "vllm==0.28.0"
 
 
 DEFAULT_MODEL = _DSV4_DEFAULT_MODELS[0]
 ARCHITECTURE = "DeepseekV4ForCausalLM"
-ATTN_KIND_TO_COMPRESS_RATIO = {"csa": 4, "hca": 128}
+# ``swa`` keeps the config's raw entry (0): serving clamps it with
+# max(1, ratio) internally, and the perf-row compress_ratio records the
+# config value the layer was built from.
+ATTN_KIND_TO_COMPRESS_RATIO = {"csa": 4, "hca": 128, "swa": 0}
+# (attn_kind, mode) -> canonical perf filename (one OpEntry per pair).
+PERF_FILES = {
+    ("csa", "context"): PerfFile.DSV4_CSA_CONTEXT_MODULE,
+    ("hca", "context"): PerfFile.DSV4_HCA_CONTEXT_MODULE,
+    ("swa", "context"): PerfFile.DSV4_SWA_CONTEXT_MODULE,
+    ("csa", "generation"): PerfFile.DSV4_CSA_GENERATION_MODULE,
+    ("hca", "generation"): PerfFile.DSV4_HCA_GENERATION_MODULE,
+    ("swa", "generation"): PerfFile.DSV4_SWA_GENERATION_MODULE,
+}
 SPARSE_KERNEL_TO_ATTN_KIND = {"paged_mqa_logits": "csa", "hca_attn": "hca"}
 SPARSE_KERNEL_TO_OP_NAME = {
     "paged_mqa_logits": "dsv4_paged_mqa_logits_module",
@@ -123,7 +175,36 @@ SPARSE_KERNEL_TO_KERNEL_SOURCE = {
     "paged_mqa_logits": "deepklox.fp8_fp4_paged_mqa_logits",
 }
 MODEL_CONFIGS_DIR = Path(__file__).resolve().parents[2] / "src" / "aisimulate_core" / "model_configs"
-SUPPORTED_GEMM_TYPES = {"fp8_block"}
+SUPPORTED_GEMM_TYPES = {"fp8_block", "mxfp8"}
+SWA_BLOCK_SIZE = 64  # DeepseekV4SWACache page size
+COMPRESSED_BLOCK_SIZE = 256  # cache_config.block_size of the compressed (C4A/C128A) caches
+
+# 0 = one sparse_mla_prefill call per vLLM prefill chunk (PREFILL_CHUNK_SIZE
+# requests), as on CUDA. >0 splits each call into <=N rows (rows are
+# independent, output unchanged; such rows are tagged +prefill_chunkN in
+# kernel_source).
+PREFILL_CHUNK_TOKENS = int(os.environ.get("AIC_VLLM_DSV4_PREFILL_CHUNK_TOKENS", "0"))
+# TODO: default to "0" (collect them) once deepklox fixes the fused-prefill
+# int32 overflow (repro_sparse_prefill_int32_overflow.py).
+SKIP_PREFILL_OVERFLOW = os.environ.get("AIC_VLLM_DSV4_SKIP_PREFILL_OVERFLOW", "1") != "0"
+# vLLM max_cudagraph_capture_size: min(2 * --max-num-seqs, 512,
+# --max-num-batched-tokens) — the CRI recipe's 128 max-num-seqs gives 256.
+MAX_CUDAGRAPH_CAPTURE_SIZE = int(os.environ.get("AIC_VLLM_DSV4_MAX_CUDAGRAPH_CAPTURE_SIZE", "256"))
+# Serving --max-model-len for decode; 0 = the model's max_position_embeddings
+# (vLLM's default).
+SERVING_MAX_MODEL_LEN = int(os.environ.get("AIC_VLLM_DSV4_MAX_MODEL_LEN", "0"))
+
+# Context-forward peak fit on CRI: hidden in + q/output (2 KiB per local head)
+# + this per token, + static.
+CONTEXT_EXTRA_KIB_PER_TOKEN = {"csa": 48, "hca": 24, "swa": 24}
+CONTEXT_STATIC_BYTES = 8 * 2**30
+# VLLM_XPU_MXFP8_USE_SYCLTLA=1: deepklox's GEMM takes an fp32 [M, N] workspace,
+# at wq_b (N = 512 per local head) 2 KiB per local head and token; 2.5 measured,
+# with allocator fragmentation.
+SYCLTLA_KIB_PER_LOCAL_HEAD = 2.5
+# An XPU OOM surfaces as UR_RESULT_ERROR_DEVICE_LOST (not OutOfMemoryError), so
+# stay below it.
+MAX_MEM_FRACTION = 0.9
 
 # Per COLLECTOR_SYSTEM: CRI needs the larger window, other systems the smaller
 # default (gdn precedent, collect_gdn_xpu.py).
@@ -145,27 +226,40 @@ def _resolve_perf_path(output_path: str | None, filename: str | None) -> str:
 
 def _read_model_config(model_id: str) -> dict:
     if os.path.isdir(model_id):
-        with open(os.path.join(model_id, "config.json"), encoding="utf-8") as f:
-            return json.load(f)
-
-    config_file = MODEL_CONFIGS_DIR / f"{model_id.replace('/', '--')}_config.json"
+        config_file = Path(model_id) / "config.json"
+    else:
+        config_file = MODEL_CONFIGS_DIR / f"{model_id.replace('/', '--')}_config.json"
     if not config_file.exists():
         raise FileNotFoundError(f"AIC packaged config not found for model_id={model_id!r}: {config_file}")
     with open(config_file, encoding="utf-8") as f:
-        return json.load(f)
+        config = json.load(f)
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict):
+        # DeepseekV41ForCausalLM nests the decoder geometry under text_config.
+        config = {
+            **text_config,
+            "architectures": config.get("architectures"),
+            "quantization_config": config.get("quantization_config"),
+        }
+    return config
 
 
 @contextmanager
-def _patched_config_dir(model_id: str, *, compress_ratio: int):
+def _patched_config_dir(model_id: str, *, compress_ratio: int, gemm_type: str):
     config = dict(_read_model_config(model_id))
     config.pop("auto_map", None)
-
+    if gemm_type == "mxfp8":
+        # BF16 checkpoint + online MXFP8 (--quantization mxfp8): the XPUMxFp8LinearKernel
+        # path the XPU o_proj bmm expects.
+        config.pop("quantization_config", None)
+    elif not config.get("quantization_config"):
+        raise ValueError(f"{model_id} has no quantization_config; fp8_block needs the checkpoint's block-fp8 recipe")
     config["model_type"] = "deepseek_v4"
     config["architectures"] = [ARCHITECTURE]
     config["num_hidden_layers"] = 1
     config["num_key_value_heads"] = 1
     config["compress_ratios"] = [compress_ratio]
-    config["rms_norm_eps"] = 1e-6
+    config.setdefault("rms_norm_eps", 1e-6)
 
     with tempfile.TemporaryDirectory(prefix=f"aic_vllm_dsv4_xpu_{compress_ratio}_{os.getpid()}_") as tmp_dir:
         with open(os.path.join(tmp_dir, "config.json"), "w", encoding="utf-8") as f:
@@ -207,10 +301,79 @@ def _init_xpu(device: str) -> None:
         get_device_module(device).set_device(device)
         # forward_mqa's prefill path asserts on the workspace manager (F5).
         init_workspace_manager(torch.device(device))
+    _install_prefill_chunking()
     # No enable_engine_fused_ops(): the CUDA helper pokes the NV IR registry,
     # while the XPU platform installs its own IR priorities
     # (rms_norm/fused_add_rms_norm -> ['vllm_c', 'native']) at module
     # construction — audited as the framework default on this wheel.
+
+
+def _install_prefill_chunking() -> None:
+    """Optionally split each sparse_mla_prefill call into <=PREFILL_CHUNK_TOKENS rows.
+
+    Rows are independent (per-query), so the output is unchanged; the split
+    only bounds deepklox's int32 q/out offsets. Idempotent via the
+    ``chunk_tokens`` marker so repeated _init_xpu calls never double-wrap.
+    """
+    original = xpu_ops.sparse_mla_prefill
+    if PREFILL_CHUNK_TOKENS <= 0 or getattr(original, "chunk_tokens", None) == PREFILL_CHUNK_TOKENS:
+        return
+
+    def chunked_sparse_mla_prefill(q, kv, indices, sm_scale, d_v, topk_length=None, output=None):
+        if output is None:
+            output = q.new_empty((*q.shape[:-1], d_v))
+        for start in range(0, q.shape[0], PREFILL_CHUNK_TOKENS):
+            rows = slice(start, start + PREFILL_CHUNK_TOKENS)
+            original(
+                q=q[rows],
+                kv=kv,
+                indices=indices[rows],
+                sm_scale=sm_scale,
+                d_v=d_v,
+                topk_length=None if topk_length is None else topk_length[rows],
+                output=output[rows],
+            )
+        return output
+
+    chunked_sparse_mla_prefill.chunk_tokens = PREFILL_CHUNK_TOKENS
+    xpu_ops.sparse_mla_prefill = staticmethod(chunked_sparse_mla_prefill)
+
+
+def _local_num_heads(model_path: str, tp_size: int) -> int:
+    return int(_read_model_config(model_path)["num_attention_heads"]) // tp_size
+
+
+def _prefill_rows_per_call(batch_size: int, query_len: int) -> int:
+    # _forward_prefill hands PREFILL_CHUNK_SIZE requests to each kernel call.
+    rows = min(batch_size, DeepseekV4XPUAttention.PREFILL_CHUNK_SIZE) * query_len
+    return min(rows, PREFILL_CHUNK_TOKENS) if PREFILL_CHUNK_TOKENS > 0 else rows
+
+
+def _fused_prefill_overflows(model_path: str, batch_size: int, query_len: int, tp_size: int) -> bool:
+    """deepklox fused sparse_mla_prefill indexes q/out with int32 ``token * h_q * d``.
+
+    A call with ``(s_q - 1) * h_q * head_dim >= 2**31`` silently corrupts memory
+    or loses the device (deepklox bug; repro script ships on the node). Only
+    reachable when PREFILL_CHUNK_TOKENS is 0 or huge.
+    """
+    if query_len <= 1:
+        return False
+    head_dim = int(_read_model_config(model_path)["head_dim"])
+    s_q = _prefill_rows_per_call(batch_size, query_len)
+    return (s_q - 1) * _local_num_heads(model_path, tp_size) * head_dim >= 2**31
+
+
+def _context_exceeds_memory(model_path: str, attn_kind: str, batch_size: int, query_len: int, tp_size: int) -> bool:
+    """Generation-time memory-feasibility filter (the one sanctioned in-collector
+    filter: size vs capacity, counted + logged — see _get_test_cases)."""
+    hidden_bytes = 2 * int(_read_model_config(model_path)["hidden_size"])
+    kib_per_head = 2 + (SYCLTLA_KIB_PER_LOCAL_HEAD if vllm_envs.VLLM_XPU_MXFP8_USE_SYCLTLA else 0)
+    per_token = (
+        hidden_bytes
+        + (kib_per_head * _local_num_heads(model_path, tp_size) + CONTEXT_EXTRA_KIB_PER_TOKEN[attn_kind]) * 1024
+    )
+    peak = CONTEXT_STATIC_BYTES + batch_size * query_len * per_token
+    return peak > MAX_MEM_FRACTION * get_device_module().get_device_properties(0).total_memory
 
 
 @contextmanager
@@ -256,6 +419,8 @@ def _init_dummy_module_tensors(module: torch.nn.Module) -> None:
                 continue
             if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.uint8):
                 tensor.zero_()
+            elif tensor.dtype == torch.float8_e8m0fnu:
+                tensor.view(torch.uint8).fill_(127)  # e8m0 exponent 127 == 1.0
             elif tensor.dtype == torch.float32 and "scale" in name:
                 tensor.fill_(1.0)
             else:
@@ -275,22 +440,25 @@ def _create_dsv4_attention_module(
     *,
     model_path: str,
     attn_kind: str,
+    gemm_type: str,
     batch_size: int,
     seq_len: int,
     tp_size: int,
     is_context: bool,
     device: str,
     query_len: int | None = None,
+    max_model_len: int | None = None,
     multi_stream: bool = True,
 ):
     compress_ratio = ATTN_KIND_TO_COMPRESS_RATIO[attn_kind]
-    with _patched_config_dir(model_path, compress_ratio=compress_ratio) as local_model:
-        max_model_len = max(seq_len, 4096)
+    with _patched_config_dir(model_path, compress_ratio=compress_ratio, gemm_type=gemm_type) as local_model:
+        if max_model_len is None:
+            max_model_len = max(seq_len, 4096)
         if query_len is None:
             query_len = seq_len if is_context else 1
         query_tokens = batch_size * query_len
         max_num_batched_tokens = max(query_tokens, 2048)
-        block_size = 256
+        block_size = COMPRESSED_BLOCK_SIZE
         cache_blocks = _cache_blocks(batch_size, seq_len)
 
         vllm_config = create_vllm_config(
@@ -306,6 +474,11 @@ def _create_dsv4_attention_module(
             max_num_batched_tokens=max_num_batched_tokens,
             use_fp8_kv_cache=True,
             trust_remote_code=True,
+            # mxfp8: point ModelConfig at the wheel's mxfp8 quantization method
+            # (the patched config dir already popped the checkpoint's fp8_block
+            # quantization_config). fp8_block: None — the config's own
+            # quantization_config drives the oneDNN reference path.
+            quantization="mxfp8" if gemm_type == "mxfp8" else None,
         )
         hf_config = vllm_config.model_config.hf_config
         hf_config.num_hidden_layers = 1
@@ -370,7 +543,7 @@ def _cache_blocks_for_block_size(batch_size: int, seq_len: int, block_size: int)
 
 
 def _cache_blocks(batch_size: int, seq_len: int) -> int:
-    return _cache_blocks_for_block_size(batch_size, seq_len, 64)
+    return _cache_blocks_for_block_size(batch_size, seq_len, SWA_BLOCK_SIZE)
 
 
 def _common_seq_lens_cpu(common):
@@ -401,7 +574,7 @@ def _make_common_metadata(
     )
     common = create_common_attn_metadata(
         batch_spec,
-        block_size=64,
+        block_size=SWA_BLOCK_SIZE,
         device=torch.device(device),
         arange_block_indices=True,
     )
@@ -556,7 +729,12 @@ def _build_metadata_and_bind_caches(attn_module: DeepseekV4XPUAttention, vllm_co
     print(f"  resolved KV cache layout: {layout}", flush=True)
 
     metadata = {}
-    num_blocks = _cache_blocks(int(common.num_reqs), int(common.max_seq_len))
+    # Allocate for the REAL context, not the (capture-pinned) common.max_seq_len:
+    # the pin exists so capture-time metadata widths match serving; the KV cache
+    # only needs to cover the actual seq lens (same basis as the runner's block
+    # pool sizing for this benchmark).
+    real_max_seq = int(_common_seq_lens_cpu(common).max())
+    num_blocks = _cache_blocks(int(common.num_reqs), real_max_seq)
     for layer in cache_layers:
         layer_metadata = _alloc_and_build_layer_cache(
             layer,
@@ -580,7 +758,7 @@ def _build_metadata_and_bind_caches(attn_module: DeepseekV4XPUAttention, vllm_co
         if spec is None:
             continue
         state_blocks = _cache_blocks_for_block_size(
-            int(common.num_reqs), int(common.max_seq_len), spec.block_size
+            int(common.num_reqs), real_max_seq, spec.block_size
         )
         state_metadata = _alloc_and_build_layer_cache(
             state_cache,
@@ -673,6 +851,29 @@ def _context_timing_mode() -> str:
     return mode
 
 
+def _graph_mode(batch_size: int, query_len: int) -> str:
+    """Graph mode the vLLM-XPU V1 runner dispatches this batch to: full, piecewise or eager."""
+    if not xpu_graph_measure_enabled() or batch_size * query_len > MAX_CUDAGRAPH_CAPTURE_SIZE:
+        return "eager"
+    return "full" if query_len == 1 else "piecewise"  # uniform decode -> FULL
+
+
+def _capture_breakable_graph(kernel_func) -> BreakableCUDAGraphCapture:
+    """Capture ``kernel_func`` as vLLM's BreakableCUDAGraphWrapper does for a PIECEWISE batch."""
+    stream = torch.xpu.Stream()
+    stream.wait_stream(torch.xpu.current_stream())
+    with torch.xpu.stream(stream), BreakableCUDAGraphCapture(pool=torch.xpu.graph_pool_handle()) as capture:
+        kernel_func()
+    torch.xpu.current_stream().wait_stream(stream)
+    torch.xpu.synchronize()
+    if capture.num_eager_breaks == 0:
+        raise RuntimeError(
+            "PIECEWISE capture has no eager break: VLLM_USE_BREAKABLE_CUDAGRAPH must be 1 before vLLM's "
+            "DeepseekV4 attention is imported"
+        )
+    return capture
+
+
 def _bench_attention_shape(
     *,
     model_path: str,
@@ -695,31 +896,41 @@ def _bench_attention_shape(
     # step.  This matches the SGLang collector's generation convention.
     metadata_seq_len = prefix_len + seq_len if is_context else seq_len + 1
     query_len = seq_len if is_context else 1
-    # Capture intent must be known before construction: graph-mode forwards run
-    # single-stream (serving parity under capture, see _create_dsv4_attention_module).
-    # Context captures too by default — the CUDA baseline benchmarks context
-    # under CUDA graph as well (collect_dsv4_attn.py passes use_cuda_graph=True
-    # on every benchmark_with_power call, including the context path), so eager
-    # XPU context is a measurement-methodology divergence, not parity. For
-    # <0.1ms launch-bound cases eager measures host launch/sync overhead instead
-    # of the op (probed: 0.065ms eager vs 0.003ms graph-replay on a 3us kernel),
-    # whose absolute jitter is the observed cross-round drift. The eager/pack
-    # variants exist only via the AIC_DSV4_PREFILL_TIMING investigation switch
-    # (see _context_timing_mode); unknown values fail closed before any GPU
-    # work.
+    # Single-token batches (decode, isl=1 prefill) take the decode path, whose
+    # capture-time metadata widths follow max_model_len (serving parity).
+    serving_max_model_len = SERVING_MAX_MODEL_LEN or int(
+        _read_model_config(model_path)["max_position_embeddings"]
+    )
+    max_model_len = max(metadata_seq_len, serving_max_model_len if query_len == 1 else 4096)
+    # Context resolves its timing via the AIC_DSV4_PREFILL_TIMING switch
+    # (default "graph" = production verdict — see _context_timing_mode). With
+    # the switch at "graph", "graph" means the vLLM-XPU V1 runner's OWN
+    # dispatch (see _graph_mode): piecewise capture for context, full capture
+    # for decode. The eager/pack variants exist only for investigation;
+    # unknown values fail closed before any GPU work.
     prefill_timing_mode = _context_timing_mode()
-    capture_planned = prefill_timing_mode == "graph" and xpu_graph_measure_enabled()
+    graph_mode = _graph_mode(batch_size, query_len)
+    if is_context and prefill_timing_mode != "graph":
+        graph_mode = "eager"  # investigation switch selects the eager quadrants
+    # Capture intent must be known before construction: graph-mode forwards run
+    # single-stream (serving parity under capture — multi_stream_utils forces
+    # aux_stream=None while a BreakableCUDAGraphCapture is active; cross-stream
+    # ops inside a raw torch.xpu.graph capture deadlock the replay on this
+    # stack, container-verified 2026-10-06).
+    capture_planned = graph_mode != "eager"
     with (
         _tp_simulation(tp_size),
         _create_dsv4_attention_module(
             model_path=model_path,
             attn_kind=attn_kind,
+            gemm_type=gemm_type,
             batch_size=batch_size,
             seq_len=metadata_seq_len,
             tp_size=tp_size,
             is_context=is_context,
             device=device,
             query_len=query_len,
+            max_model_len=max_model_len,
             multi_stream=not capture_planned,
         ) as (attn_module, vllm_config),
     ):
@@ -730,14 +941,37 @@ def _bench_attention_shape(
             device=device,
             query_len=query_len,
         )
+        if graph_mode == "full":
+            # GPUModelRunner._build_attention_metadata(for_cudagraph_capture=True):
+            # capture-time metadata is built against max_model_len so replayed
+            # shapes match serving (pins the C128A top-k width). The KV cache
+            # itself is still allocated for the real context (see
+            # _build_metadata_and_bind_caches).
+            common.max_seq_len = max_model_len
         metadata = _build_metadata_and_bind_caches(attn_module, vllm_config, common, device=device)
 
         hf_config = vllm_config.model_config.hf_config
         concrete_layer = vllm_config.compilation_config.static_forward_context[attn_module.prefix]
         backend_name = concrete_layer.get_attn_backend().get_name()
         cache_spec = concrete_layer.get_kv_cache_spec(vllm_config)
+        if cache_spec is None and attn_kind == "swa":
+            # swa-only layer (compress_ratios == 0): the main prefix registers
+            # no KV cache — its KV lives in swa_cache_layer (serving's
+            # swa_only branch of DeepseekV4XPUAttention). Resolve the spec and
+            # bytes/token from the SWA cache so the row still records the
+            # framework's own page geometry.
+            swa_layer = attn_module.swa_cache_layer
+            swa_registered = vllm_config.compilation_config.static_forward_context[swa_layer.prefix]
+            cache_spec = swa_registered.get_kv_cache_spec(vllm_config)
+            if cache_spec is None:
+                raise RuntimeError("DSV4 swa layer has neither a main nor an swa KV-cache spec")
+            backend_name += "+swa_cache"
         if cache_spec is None:
             raise RuntimeError(f"DSV4 {attn_kind} layer did not register a KV-cache spec")
+        if is_context and 0 < PREFILL_CHUNK_TOKENS < min(batch_size, attn_module.PREFILL_CHUNK_SIZE) * query_len:
+            # _install_prefill_chunking splits the fused prefill call; say so in
+            # kernel_source so rows stay attributable (deepklox int32 guard).
+            backend_name += f"+prefill_chunk{PREFILL_CHUNK_TOKENS}"
         architecture = hf_config.architectures[0] if hf_config.architectures else ARCHITECTURE
         # Persisted ``num_heads`` is rank-LOCAL (unified #1429 convention);
         # consumers derive native as ``num_heads * tp_size``. vllm's own
@@ -759,6 +993,7 @@ def _bench_attention_shape(
         )
         positions = common.positions
 
+        capture = None
         with set_current_vllm_config(vllm_config), set_forward_context(metadata, vllm_config), torch.inference_mode():
             attn_module(positions, hidden_states, None)
             get_device_module(device).synchronize()
@@ -772,24 +1007,25 @@ def _bench_attention_shape(
 
             # Context resolves its timing via the AIC_DSV4_PREFILL_TIMING
             # switch (default "graph" = production verdict, NV parity — see
-            # _context_timing_mode / capture_planned above). Graph mode
-            # replays once per capture (context is kernel-bound here; the CUDA
-            # baseline also uses repeat_n=1). Generation is NOT controlled by
-            # the switch: it always packs pack_n replays into one capture when
-            # graph measurement is enabled — decode launch overhead dominates
-            # small shapes (report §4.5). A capture failure fails the case
+            # _context_timing_mode / graph_mode above). With the switch at
+            # "graph", context runs PIECEWISE (the serving dispatch) with
+            # pack_n=1: serving pays one piecewise replay per layer per step,
+            # so packing would understate it. repeat_n=1 (kernel-bound; the
+            # CUDA baseline also uses repeat_n=1). Generation is NOT controlled
+            # by the switch: it always takes the runner's full-graph decode
+            # path and packs pack_n replays into one capture when graph
+            # measurement is enabled — decode launch overhead dominates small
+            # shapes (report §4.5). A capture failure fails the case
             # (allow_graph_fail=False).
             timing_label = None
-            use_graph = capture_planned
             kv_bytes_per_token = int(cache_spec.page_size_bytes) // int(cache_spec.block_size)
             if is_context:
-                if use_graph:
+                if graph_mode == "piecewise":
+                    capture = _capture_breakable_graph(kernel_func)
                     pack_n = 1
                     repeat_n = 1
-                    timing_label = "graph"
-
-                    def run():
-                        kernel_func()
+                    timing_label = "graph_piecewise"
+                    run = capture.replay
                 elif prefill_timing_mode == "eager_rep":
                     pack_n = 1
                     repeat_n = 10
@@ -806,14 +1042,15 @@ def _bench_attention_shape(
                         for _ in range(pack_n):
                             kernel_func()
                 else:
-                    # graph requested but the platform has no graph
-                    # support (capture_planned False) — degrade to eager and
-                    # record what actually ran (used_cuda_graph / timing_mode).
+                    # graph requested but the runner dispatch says eager
+                    # (batch*query above MAX_CUDAGRAPH_CAPTURE_SIZE, or the
+                    # platform has no graph support) — degrade and record what
+                    # actually ran (used_cuda_graph / timing_mode).
                     pack_n = 1
                     repeat_n = 10
                     timing_label = "eager_repeat10"
                     run = kernel_func
-            elif use_graph:
+            elif graph_mode == "full":
                 # Per-call KV read: index_topk tokens from the main cache plus
                 # the sliding window from the SWA cache, both in the same
                 # per-token bytes. Bytes/token come from the framework spec at
@@ -841,11 +1078,13 @@ def _bench_attention_shape(
                 num_warmups=warming_up,
                 num_runs=test_ite,
                 repeat_n=repeat_n,
-                use_cuda_graph=use_graph,
+                use_cuda_graph=capture is None and graph_mode == "full",
                 allow_graph_fail=False,
             ) as result:
                 pass
 
+    used_graph = capture is not None or bool(result.get("used_cuda_graph", False))
+    timing_mode = timing_label or ("graph_pack" if used_graph else "eager_repeat10")
     latency = float(result["latency_ms"]) / pack_n
     log_perf(
         item_list=[
@@ -862,14 +1101,13 @@ def _bench_attention_shape(
                 "step": prefix_len if is_context else seq_len,
                 "compress_ratio": ATTN_KIND_TO_COMPRESS_RATIO[attn_kind],
                 "latency": f"{latency:.4f}",
-                "used_cuda_graph": result.get("used_cuda_graph", False),
+                "used_cuda_graph": used_graph,
                 # Measurement-method self-description (AIC_DSV4_PREFILL_TIMING
                 # design): rows must be attributable to a timing method without
                 # the run log. Context rows carry the switch-resolved method
-                # (graph / eager_repeat10 / eager_packN); generation rows carry
-                # their effective method.
-                "timing_mode": timing_label
-                or ("graph_pack" if use_graph else "eager_repeat10"),
+                # (graph_piecewise / eager_repeat10 / eager_packN); generation
+                # rows carry their effective method (graph_pack / eager).
+                "timing_mode": timing_mode,
             }
         ],
         framework="VLLM",
@@ -883,11 +1121,11 @@ def _bench_attention_shape(
     print(
         f"[vllm-dsv4-xpu] {attn_kind} {mode} b={batch_size} s={seq_len} prefix={prefix_len} "
         f"heads={local_num_heads} backend={backend_name} pack_n={pack_n} "
-        f"timing={timing_label or ('graph_pack' if use_graph else 'eager_repeat10')} "
-        f"graph={result.get('used_cuda_graph', False)} latency={latency:.4f} ms",
+        f"graph={graph_mode} timing={timing_mode} graph_exec={used_graph} "
+        f"latency={latency:.4f} ms",
         flush=True,
     )
-    del attn_module, vllm_config, hidden_states, positions
+    del attn_module, vllm_config, metadata, common, hidden_states, positions, capture
     get_device_module(device).empty_cache()
     gc.collect()
     return latency
@@ -1124,6 +1362,11 @@ def _bench_sparse_kernel_shape(
             _create_dsv4_attention_module(
                 model_path=model_path,
                 attn_kind=attn_kind,
+                # Sparse-kernel benches measure the deepklox kernel directly;
+                # the module is only scaffolding for cache/metadata, so pin
+                # the serving mxfp8 quant path for its construction (the
+                # checkpoint's fp8_block config dir is not needed here).
+                gemm_type="mxfp8",
                 batch_size=batch_size,
                 seq_len=full_seq_len,
                 tp_size=tp_size,
@@ -1222,7 +1465,7 @@ def run_dsv4_attn_worker(
     perf_filename: str,
     device: str = "xpu:0",
 ) -> None:
-    if attn_kind not in DSV4_ATTN_KINDS:
+    if attn_kind not in ATTN_KIND_TO_COMPRESS_RATIO:
         raise ValueError(f"unknown attn_kind={attn_kind}")
     if tp_size not in _DSV4_MODULE_TP_SIZES:
         raise ValueError(f"unsupported tp_size={tp_size}")
@@ -1310,40 +1553,101 @@ def run_dsv4_sparse_kernel_worker(
 
 
 # collect.py resolves get_func AND run_func from the OpEntry's own module, so
-# the XPU module re-exports the case builders under the same names as the CUDA
-# registry (gdn precedent) — the grids are shared with CUDA on purpose (NV↔XPU
-# alignment needs a comparable subset).
-get_dsv4_csa_context_test_cases = get_xpu_dsv4_csa_context_test_cases
-get_dsv4_hca_context_test_cases = get_xpu_dsv4_hca_context_test_cases
-get_dsv4_csa_generation_test_cases = get_xpu_dsv4_csa_generation_test_cases
-get_dsv4_hca_generation_test_cases = get_xpu_dsv4_hca_generation_test_cases
+# the XPU module exposes the case builders under the same names as the CUDA
+# registry (gdn precedent). These wrap the yaml-driven grids with the two
+# XPU-only pre-queue filters: deepklox's fused-prefill int32 overflow and the
+# generation-time memory-feasibility filter (drops are counted + logged, per
+# layer_permissions.md's sanctioned filter).
+
+
+def _get_test_cases(attn_kind: str, mode: str) -> list[list]:
+    cases = []
+    skipped: dict[str, list] = {}
+    for case in get_xpu_dsv4_attn_test_cases(attn_kind, mode):
+        seq_len, batch_size, tp_size, model_path = case[0], case[1], case[2], case[6]
+        query_len = seq_len if mode == "context" else 1
+        if SKIP_PREFILL_OVERFLOW and _fused_prefill_overflows(model_path, batch_size, query_len, tp_size):
+            reason = (
+                "fused sparse_mla_prefill int32 overflow (deepklox bug; run with "
+                "AIC_VLLM_DSV4_PREFILL_CHUNK_TOKENS=8192, or AIC_VLLM_DSV4_SKIP_PREFILL_OVERFLOW=0 once fixed)"
+            )
+        elif mode == "context" and _context_exceeds_memory(model_path, attn_kind, batch_size, query_len, tp_size):
+            reason = f"estimated forward peak > {MAX_MEM_FRACTION:.0%} of device memory (XPU OOM = DEVICE_LOST)"
+        else:
+            cases.append(case)
+            continue
+        skipped.setdefault(reason, []).append((model_path.split("/")[-1], batch_size, seq_len, tp_size))
+    for reason, shapes in skipped.items():
+        print(
+            f"[vllm-xpu-dsv4] dsv4_{attn_kind}_{mode}_module: skipping {len(shapes)} (model, batch, isl, tp) "
+            f"shapes, {reason}: {shapes}",
+            flush=True,
+        )
+    return cases
+
+
+def get_dsv4_csa_context_test_cases():
+    return _get_test_cases("csa", "context")
+
+
+def get_dsv4_swa_context_test_cases():
+    return _get_test_cases("swa", "context")
+
+
+def get_dsv4_hca_context_test_cases():
+    return _get_test_cases("hca", "context")
+
+
+def get_dsv4_csa_generation_test_cases():
+    return _get_test_cases("csa", "generation")
+
+
+def get_dsv4_swa_generation_test_cases():
+    return _get_test_cases("swa", "generation")
+
+
+def get_dsv4_hca_generation_test_cases():
+    return _get_test_cases("hca", "generation")
+
+
 get_dsv4_paged_mqa_logits_test_cases = get_xpu_dsv4_paged_mqa_logits_test_cases
 get_dsv4_hca_attn_test_cases = get_xpu_dsv4_hca_attn_test_cases
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Collect vLLM DeepSeek-V4 attention module latency on XPU.")
+    parser = argparse.ArgumentParser(description="Collect one vLLM-XPU DeepSeek-V4 attention-module shape.")
     parser.add_argument("--model-path", default=DEFAULT_MODEL)
     parser.add_argument("--mode", choices=["context", "generation"], default="context")
-    parser.add_argument("--attn-kind", choices=list(DSV4_ATTN_KINDS), default="csa")
+    parser.add_argument("--attn-kind", choices=list(ATTN_KIND_TO_COMPRESS_RATIO), default="csa")
     parser.add_argument("--sparse-kernel", choices=list(DSV4_SPARSE_KERNELS), default=None)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--past-kv", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=64)
+    parser.add_argument("--past-kv", type=int, default=0, help="context prefix length")
+    parser.add_argument("--seq-len", type=int, default=64, help="context: isl; generation: decode step (past KV)")
     parser.add_argument("--tp-size", type=int, default=1)
-    parser.add_argument("--gemm-type", default="fp8_block")
+    parser.add_argument("--gemm-type", choices=sorted(SUPPORTED_GEMM_TYPES), default="mxfp8")
     parser.add_argument("--device", default="xpu:0")
-    parser.add_argument("--output-path", default=None)
+    parser.add_argument("--output-path", default=None, help="directory (or *.txt file) for the perf rows")
 
     args = parser.parse_args()
-    filename = {
-        ("csa", "context"): PerfFile.DSV4_CSA_CONTEXT_MODULE.value,
-        ("hca", "context"): PerfFile.DSV4_HCA_CONTEXT_MODULE.value,
-        ("csa", "generation"): PerfFile.DSV4_CSA_GENERATION_MODULE.value,
-        ("hca", "generation"): PerfFile.DSV4_HCA_GENERATION_MODULE.value,
-    }[(args.attn_kind, args.mode)]
     if args.gemm_type not in SUPPORTED_GEMM_TYPES:
         raise ValueError(f"unsupported vLLM DSV4 gemm_type={args.gemm_type}; supported={sorted(SUPPORTED_GEMM_TYPES)}")
+    perf_filename = PERF_FILES[(args.attn_kind, args.mode)].value
+    if args.output_path:
+        if args.output_path.endswith(".txt"):
+            perf_filename = args.output_path
+        else:
+            os.makedirs(args.output_path, exist_ok=True)
+            perf_filename = os.path.join(args.output_path, perf_filename)
+    query_len = args.seq_len if args.mode == "context" else 1
+    if SKIP_PREFILL_OVERFLOW and _fused_prefill_overflows(args.model_path, args.batch_size, query_len, args.tp_size):
+        raise SystemExit(
+            "shape overflows the fused sparse_mla_prefill int32 offsets (deepklox bug); set "
+            "AIC_VLLM_DSV4_PREFILL_CHUNK_TOKENS=8192, or AIC_VLLM_DSV4_SKIP_PREFILL_OVERFLOW=0 once fixed"
+        )
+    if args.mode == "context" and _context_exceeds_memory(
+        args.model_path, args.attn_kind, args.batch_size, query_len, args.tp_size
+    ):
+        raise SystemExit(f"estimated forward peak > {MAX_MEM_FRACTION:.0%} of device memory (XPU OOM = DEVICE_LOST)")
     _init_xpu(args.device)
     if args.sparse_kernel is not None:
         sparse_filename = SPARSE_KERNEL_TO_PERF_FILE[args.sparse_kernel].value
@@ -1362,7 +1666,6 @@ def main() -> None:
         )
         return
 
-    perf_filename = _resolve_perf_path(args.output_path, filename)
     _bench_attention_shape(
         model_path=args.model_path,
         attn_kind=args.attn_kind,
