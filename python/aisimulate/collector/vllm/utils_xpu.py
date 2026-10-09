@@ -14,6 +14,7 @@ and backend compatibility shims used by the XPU collectors.
 import functools
 import inspect
 import os
+import socket
 from contextlib import ExitStack
 from dataclasses import dataclass
 from functools import wraps
@@ -242,6 +243,7 @@ def create_vllm_config(
     head_dim: int | None = None,
     num_heads: int | None = None,
     num_kv_heads: int | None = None,
+    quantization: str | None = None,
 ) -> VllmConfig:
     """Create a VllmConfig for testing with reasonable defaults."""
 
@@ -252,6 +254,7 @@ def create_vllm_config(
         dtype=dtype,
         seed=0,
         max_model_len=max_model_len,
+        quantization=quantization,
     )
 
     try:
@@ -612,14 +615,32 @@ def create_and_prepopulate_kv_cache(
     return kv_cache
 
 
+_PORT_STRIDE = 100  # per-card port range width (8889 + device_idx*100 .. +99)
+
+
 @functools.cache  # only run once per process
 def setup_distributed(device):
-    # Each process needs to use a different port. Bare device strings
-    # ("xpu"/"cuda") carry no ordinal, so default to device 0.
+    # Bare device strings ("xpu"/"cuda") carry no ordinal, so default to device 0.
     device_idx = torch.device(device).index
     if device_idx is None:
         device_idx = 0
-    port = 8889 + device_idx
+    # Deterministic per-card port range (bind(0) probes race when parallel_run
+    # workers all reach here at once): ranges are disjoint per device_idx; scan
+    # upward on EADDRINUSE to skip ports held by orphaned workers.
+    port = None
+    base = 8889 + device_idx * _PORT_STRIDE
+    for candidate in range(base, base + _PORT_STRIDE):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(("", candidate))
+        except OSError:
+            continue
+        port = candidate
+        break
+    if port is None:
+        raise RuntimeError(
+            f"no free port in {base}..{base + _PORT_STRIDE - 1} "
+            f"for device {device_idx}")
     print(device, device_idx, port)
 
     os.environ["RANK"] = "0"

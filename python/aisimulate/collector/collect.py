@@ -1477,6 +1477,9 @@ def _is_cuda_fatal_exception(exc, torch_mod) -> bool:
             "cublas_status_execution_failed",
             "cublas_status_internal_error",
             "cublas_status_alloc_failed",
+            # XPU (Level Zero): a lost device poisons every later task in-process — reset the worker.
+            "ur_result_error_device_lost",
+            "ur_result_error_out_of_device_memory",
         )
         is_cuda_fatal = any(marker in error_text for marker in fatal_markers)
     if not is_cuda_fatal:
@@ -2537,23 +2540,14 @@ def generate_collection_summary(all_errors, backend, version):
 
 
 def _all_op_names() -> list[str]:
-    """Collect all unique op names across normal and WideEP registries."""
-    from collector.sglang.registry import REGISTRY as SGLANG_REG
-    from collector.trtllm.registry import REGISTRY as TRTLLM_REG
-    from collector.vllm.registry import REGISTRY as VLLM_REG
+    """Collect all unique op names across the framework registries."""
+    # XPU ops come via the framework-key mechanism (vllm_xpu -> REGISTRY_XPU), not a peer registry.
+    from collector.framework_manifest import _REGISTRY_MODULES, _registry_entries
 
     seen = set()
     ops = []
-    registries = [
-        TRTLLM_REG,
-        VLLM_REG,
-        SGLANG_REG,
-        _wideep_registry_for_backend("trtllm"),
-        _wideep_registry_for_backend("vllm"),
-        _wideep_registry_for_backend("sglang"),
-    ]
-    for reg in registries:
-        for entry in reg:
+    for framework_key in _REGISTRY_MODULES:
+        for entry in _registry_entries(framework_key):
             if entry.op not in seen:
                 seen.add(entry.op)
                 ops.append(entry.op)

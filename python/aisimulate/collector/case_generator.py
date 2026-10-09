@@ -15,6 +15,7 @@ import functools
 import itertools
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -3042,6 +3043,129 @@ def get_dsv4_csa_attn_test_cases():
     (csa_attn is the CSA sparse FMLA over the topk-selected c4 positions),
     1:1 with the csa-module rows — same source as paged_mqa_logits/topk."""
     return [[model_path, "csa_attn"] for model_path in _selected_dsv4_models()]
+
+
+# XPU (CRI) DSV4 case builders — re-exported by collect_dsv4_attn_xpu.py as its
+# OpEntry get_funcs. Grids: common_case_values.dsv4_xpu_attention; gemm_type is
+# mxfp8 only (fp8_block routes the XPU wo_a bmm to oneDNN's reference path).
+
+
+def get_xpu_dsv4_attn_test_cases(attn_kind: str, mode: str) -> list[list]:
+    """DSV4 attention-module cases for the vLLM-XPU (CRI) collector.
+
+    One case per shape from ``common_case_values.dsv4_xpu_attention`` grids,
+    laid out as ``run_dsv4_attn_worker``'s positional args::
+
+        [seq_len, batch_size, tp_size, "fp8", "bfloat16", gemm_type, model_path,
+         attn_kind, None, (prefix_len — context only)]
+    """
+    if mode not in ("context", "generation"):
+        raise ValueError(f"unsupported DeepSeek-V4 mode: {mode}")
+    grids = _required_base_common_case_values("dsv4_xpu_attention").get("grids")
+    if not isinstance(grids, list):
+        raise TypeError("common_case_values.dsv4_xpu_attention.grids must be a list")
+    model_filter = _get_model_path_filter()
+    # --smoke shrinks to the module smoke regression shapes; other grid fields stay as declared.
+    smoke = "--smoke" in sys.argv
+
+    cases: list[list] = []
+    for index, grid in enumerate(grids):
+        grid = _required_mapping(grid, field_name=f"dsv4_xpu_attention.grids[{index}]")
+        if attn_kind not in _as_str_list(grid["attn_kinds"], field_name="attn_kinds"):
+            continue
+        max_batch_tokens = int(grid["max_batch_tokens"])
+        if mode == "context":
+            batch_sizes = _as_int_list(grid["context_batch_sizes"], field_name="context_batch_sizes")
+            seq_lens = [64] if smoke else _as_int_list(
+                grid["context_sequence_lengths"], field_name="context_sequence_lengths"
+            )
+            prefix_lens = [0, 128] if smoke else _as_int_list(
+                grid["context_prefix_lengths"], field_name="context_prefix_lengths"
+            )
+        else:
+            batch_sizes = _as_int_list(grid["generation_batch_sizes"], field_name="generation_batch_sizes")
+            seq_lens = [64] if smoke else _as_int_list(grid["generation_steps"], field_name="generation_steps")
+            prefix_lens = [0]
+        for model_path in _as_str_list(grid["model_paths"], field_name="model_paths"):
+            if model_filter is not None and model_filter != model_path:
+                continue
+            for gemm_type in _as_str_list(grid["gemm_types"], field_name="gemm_types"):
+                for tp_size in _as_int_list(grid["tp_sizes"], field_name="tp_sizes"):
+                    for batch_size in batch_sizes:
+                        for seq_len in seq_lens:
+                            for prefix_len in prefix_lens:
+                                if batch_size * (prefix_len + seq_len) > max_batch_tokens:
+                                    continue
+                                case = [seq_len, batch_size, tp_size, "fp8", "bfloat16", gemm_type]
+                                case += [model_path, attn_kind, None]
+                                if mode == "context":
+                                    case.append(prefix_len)
+                                cases.append(case)
+    return cases
+
+
+def _xpu_dsv4_sparse_rows(kernel: str) -> list[list]:
+    if kernel not in DSV4_SPARSE_KERNELS:
+        raise ValueError(f"unknown sparse kernel={kernel}")
+    model_paths = _selected_dsv4_models()
+    if not model_paths:
+        return []
+
+    tp_list = _DSV4_SPARSE_TP_LIST_ATTN if kernel == "hca_attn" else _DSV4_SPARSE_TP_LIST_INDEXER
+    if "--smoke" in sys.argv:
+        smoke_shapes = [
+            (1, 1, 8192),
+            (1, 64, 8192),
+        ]
+        return [
+            [bs, isl, past_kv, 1, kernel, model_path] for model_path in model_paths for bs, isl, past_kv in smoke_shapes
+        ]
+
+    cases: list[list] = []
+    for model_path in model_paths:
+        for tp_size in tp_list:
+            for bs in _DSV4_SPARSE_BS_LIST:
+                for isl in _DSV4_SPARSE_ISL_LIST:
+                    if bs * isl > _DSV4_XPU_MAX_SPARSE_QUERY_TOKENS:
+                        continue
+                    for past_kv in _DSV4_SPARSE_PAST_KV_LIST:
+                        full_s = isl + past_kv
+                        if bs * full_s > _DSV4_SPARSE_MAX_FULL_S:
+                            continue
+                        cases.append([bs, isl, past_kv, tp_size, kernel, model_path])
+    return cases
+
+
+def get_xpu_dsv4_csa_context_test_cases():
+    return get_xpu_dsv4_attn_test_cases("csa", "context")
+
+
+def get_xpu_dsv4_hca_context_test_cases():
+    return get_xpu_dsv4_attn_test_cases("hca", "context")
+
+
+def get_xpu_dsv4_swa_context_test_cases():
+    return get_xpu_dsv4_attn_test_cases("swa", "context")
+
+
+def get_xpu_dsv4_csa_generation_test_cases():
+    return get_xpu_dsv4_attn_test_cases("csa", "generation")
+
+
+def get_xpu_dsv4_hca_generation_test_cases():
+    return get_xpu_dsv4_attn_test_cases("hca", "generation")
+
+
+def get_xpu_dsv4_swa_generation_test_cases():
+    return get_xpu_dsv4_attn_test_cases("swa", "generation")
+
+
+def get_xpu_dsv4_paged_mqa_logits_test_cases():
+    return _xpu_dsv4_sparse_rows("paged_mqa_logits")
+
+
+def get_xpu_dsv4_hca_attn_test_cases():
+    return _xpu_dsv4_sparse_rows("hca_attn")
 
 
 # Backward-compatible names for older PR comments/tests while the registry and

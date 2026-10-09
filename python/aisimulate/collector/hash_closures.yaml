@@ -225,8 +225,19 @@ collector.vllm.collect_kda:
   - collector/cases/base_ops/kda.yaml
   - __model_cases__
 collector.vllm.collect_dsv4_attn:
+  # Case builders read the model-yaml dsv4 block AND the base-op budget declaration.
+  - collector/cases/base_ops/dsv4_attention.yaml
+  - __model_cases__
+collector.vllm.collect_dsv4_attn_xpu:
+  # get_funcs re-exported from case_generator's XPU builders; utils_xpu.py supplies the toolkit.
+  - collector/cases/base_ops/dsv4_attention.yaml
+  - collector/vllm/utils_xpu.py
   - __model_cases__
 collector.vllm.collect_gdn:
+  - collector/cases/base_ops/gdn.yaml
+  - __model_cases__
+collector.vllm.collect_gdn_xpu:
+  # Same case reads as the CUDA gdn collector (shared get_gdn_test_cases).
   - collector/cases/base_ops/gdn.yaml
   - __model_cases__
 collector.vllm.collect_gemm:
@@ -239,6 +250,11 @@ collector.vllm.collect_gemm_xpu:
 collector.vllm.collect_mhc_module:
   - collector/cases/base_ops/mhc.yaml
   - __model_cases__
+collector.vllm.collect_mhc_module_xpu:
+  # Same case reads as the CUDA mhc collector; utils_xpu.py supplies the XPU toolkit.
+  - collector/cases/base_ops/mhc.yaml
+  - collector/vllm/utils_xpu.py
+  - __model_cases__
 collector.vllm.collect_mla_module:
   - collector/cases/base_ops/mla_module.yaml
   - __model_cases__
@@ -246,6 +262,11 @@ collector.vllm.collect_mla_module_027:
   # 0.27.0-route shim whose get/run functions are re-exported from
   # collector/vllm/collect_mla_module.py — identical case reads.
   - collector/cases/base_ops/mla_module.yaml
+  - __model_cases__
+collector.vllm.collect_mla_module_xpu:
+  # XPU MLA/DSA module collector (dsa_*_module ops); utils_xpu.py supplies the XPU toolkit.
+  - collector/cases/base_ops/mla_module.yaml
+  - collector/vllm/utils_xpu.py
   - __model_cases__
 collector.vllm.collect_moe:
   - collector/cases/base_ops/moe.yaml
