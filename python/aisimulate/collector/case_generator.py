@@ -21,7 +21,6 @@ from typing import Optional
 
 import yaml
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -2461,7 +2460,9 @@ def get_xpu_mla_module_test_cases(phase: str) -> list[list]:
     batch_sizes = _as_int_list(phase_cfg.get("batch_sizes"), field_name=f"mla_module.xpu.{phase}.batch_sizes")
     seq_lens = _as_int_list(phase_cfg.get("sequence_lengths"), field_name=f"mla_module.xpu.{phase}.sequence_lengths")
     prefix_lengths = (
-        _optional_int_list(phase_cfg.get("prefix_lengths"), field_name="mla_module.xpu.context.prefix_lengths", default=[0])
+        _optional_int_list(
+            phase_cfg.get("prefix_lengths"), field_name="mla_module.xpu.context.prefix_lengths", default=[0]
+        )
         if phase == "context"
         else [0]
     )
@@ -3076,11 +3077,11 @@ def get_xpu_dsv4_attn_test_cases(attn_kind: str, mode: str) -> list[list]:
         max_batch_tokens = int(grid["max_batch_tokens"])
         if mode == "context":
             batch_sizes = _as_int_list(grid["context_batch_sizes"], field_name="context_batch_sizes")
-            seq_lens = [64] if smoke else _as_int_list(
-                grid["context_sequence_lengths"], field_name="context_sequence_lengths"
+            seq_lens = (
+                [64] if smoke else _as_int_list(grid["context_sequence_lengths"], field_name="context_sequence_lengths")
             )
-            prefix_lens = [0, 128] if smoke else _as_int_list(
-                grid["context_prefix_lengths"], field_name="context_prefix_lengths"
+            prefix_lens = (
+                [0, 128] if smoke else _as_int_list(grid["context_prefix_lengths"], field_name="context_prefix_lengths")
             )
         else:
             batch_sizes = _as_int_list(grid["generation_batch_sizes"], field_name="generation_batch_sizes")

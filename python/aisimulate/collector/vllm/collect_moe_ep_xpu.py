@@ -60,10 +60,6 @@ import gc
 import os
 
 import torch
-from vllm.version import __version__ as vllm_version
-from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
-from vllm_xpu_kernels.moe_utils import quant_fp8_block_act
-
 from collector.case_generator import get_xpu_moe_ep_test_cases
 from collector.helper import (
     benchmark_with_power,
@@ -83,6 +79,9 @@ from collector.wideep.vllm.collect_moe_ep import (
     _moe_expert_compute_perf_path,
     _power_columns,
 )
+from vllm.version import __version__ as vllm_version
+from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
+from vllm_xpu_kernels.moe_utils import quant_fp8_block_act
 
 _DISTRIBUTIONS = ("uniform", "power_law")
 
@@ -168,6 +167,7 @@ def _make_xpu_fused_moe_bench(
         ep_rank=0,
         ep_size=moe_ep_size,
     )
+
     def _to_kernel_routing(topk_ids, topk_weights):
         """Rank-local routing -> what ``XPUExperts`` receives after DeepEP HT dispatch.
 

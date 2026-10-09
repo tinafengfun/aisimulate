@@ -638,9 +638,7 @@ def setup_distributed(device):
         port = candidate
         break
     if port is None:
-        raise RuntimeError(
-            f"no free port in {base}..{base + _PORT_STRIDE - 1} "
-            f"for device {device_idx}")
+        raise RuntimeError(f"no free port in {base}..{base + _PORT_STRIDE - 1} for device {device_idx}")
     print(device, device_idx, port)
 
     os.environ["RANK"] = "0"

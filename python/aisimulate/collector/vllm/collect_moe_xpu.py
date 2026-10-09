@@ -426,24 +426,20 @@ def create_fp8_block_weights_xpu(
     else:
         local_num_experts, expert_map = expert_map_result
 
-    w13 = torch.randn(
-        local_num_experts, 2 * padded_inter, padded_hidden, dtype=torch.bfloat16, device=device
-    ).to(torch.float8_e4m3fn)
-    w2 = torch.randn(
-        local_num_experts, padded_hidden, padded_inter, dtype=torch.bfloat16, device=device
-    ).to(torch.float8_e4m3fn)
+    w13 = torch.randn(local_num_experts, 2 * padded_inter, padded_hidden, dtype=torch.bfloat16, device=device).to(
+        torch.float8_e4m3fn
+    )
+    w2 = torch.randn(local_num_experts, padded_hidden, padded_inter, dtype=torch.bfloat16, device=device).to(
+        torch.float8_e4m3fn
+    )
 
     # Block scales: fp32 [E, N // 128, K // 128] -> detected as block-fp8.
     w13_scales = (
-        torch.rand(
-            local_num_experts, 2 * padded_inter // 128, padded_hidden // 128, dtype=torch.float32, device=device
-        )
+        torch.rand(local_num_experts, 2 * padded_inter // 128, padded_hidden // 128, dtype=torch.float32, device=device)
         + 0.5
     )
     w2_scales = (
-        torch.rand(
-            local_num_experts, padded_hidden // 128, padded_inter // 128, dtype=torch.float32, device=device
-        )
+        torch.rand(local_num_experts, padded_hidden // 128, padded_inter // 128, dtype=torch.float32, device=device)
         + 0.5
     )
     return w13, w2, w13_scales, w2_scales, local_num_experts, padded_hidden
@@ -471,12 +467,12 @@ def create_mxfp8_weights_xpu(
     else:
         local_num_experts, expert_map = expert_map_result
 
-    w13 = torch.randn(
-        local_num_experts, 2 * padded_inter, padded_hidden, dtype=torch.bfloat16, device=device
-    ).to(torch.float8_e4m3fn)
-    w2 = torch.randn(
-        local_num_experts, padded_hidden, padded_inter, dtype=torch.bfloat16, device=device
-    ).to(torch.float8_e4m3fn)
+    w13 = torch.randn(local_num_experts, 2 * padded_inter, padded_hidden, dtype=torch.bfloat16, device=device).to(
+        torch.float8_e4m3fn
+    )
+    w2 = torch.randn(local_num_experts, padded_hidden, padded_inter, dtype=torch.bfloat16, device=device).to(
+        torch.float8_e4m3fn
+    )
 
     # e8m0 block scales (uint8 bits near exponent 127 == 2^0) -> detected as mxfp8.
     w13_scales = torch.randint(

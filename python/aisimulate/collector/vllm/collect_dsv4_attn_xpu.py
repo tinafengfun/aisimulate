@@ -85,23 +85,12 @@ _os_pre.environ.setdefault("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
 
 import torch
 import vllm.envs as vllm_envs
-from deepklox import fp8_fp4_paged_mqa_logits, get_paged_mqa_logits_metadata
 import vllm_xpu_kernels._xpu_C  # noqa: F401
-from vllm._xpu_ops import xpu_ops
-from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
-from vllm.config import set_current_vllm_config
-from vllm.forward_context import set_forward_context
-from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
-from vllm.models.deepseek_v4.xpu.xpu_sparse import DeepseekV4XPUAttention
-from vllm.utils.torch_utils import set_default_torch_dtype
-from vllm.v1.worker.workspace import init_workspace_manager
-from vllm.version import __version__ as vllm_version
-
 from collector.case_generator import (
-    DSV4_SPARSE_KERNELS,
     _DSV4_DEFAULT_MODELS,
     _DSV4_MODULE_TP_SIZES,
     _DSV4_SPARSE_MAX_FULL_S,
+    DSV4_SPARSE_KERNELS,
     get_xpu_dsv4_attn_test_cases,
     get_xpu_dsv4_hca_attn_test_cases,
     get_xpu_dsv4_paged_mqa_logits_test_cases,
@@ -119,6 +108,16 @@ from collector.vllm.utils_xpu import (
     create_vllm_config,
     setup_distributed,
 )
+from deepklox import fp8_fp4_paged_mqa_logits, get_paged_mqa_logits_metadata
+from vllm._xpu_ops import xpu_ops
+from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+from vllm.config import set_current_vllm_config
+from vllm.forward_context import set_forward_context
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.models.deepseek_v4.xpu.xpu_sparse import DeepseekV4XPUAttention
+from vllm.utils.torch_utils import set_default_torch_dtype
+from vllm.v1.worker.workspace import init_workspace_manager
+from vllm.version import __version__ as vllm_version
 
 __compat__ = "vllm==0.28.0"
 
@@ -628,9 +627,7 @@ def _alloc_and_build_layer_cache(
     if spec is None:
         print(f"  [{layer_obj.prefix}] spec=None (no KV cache)", flush=True)
         return None
-    kernel_block_size = (
-        remap_block_size if remap_block_size is not None else getattr(spec, "storage_block_size", None)
-    )
+    kernel_block_size = remap_block_size if remap_block_size is not None else getattr(spec, "storage_block_size", None)
     group = AttentionGroup(
         backend=registered.get_attn_backend(),
         layer_names=[layer_obj.prefix],
@@ -661,9 +658,7 @@ def _alloc_and_build_layer_cache(
         host_resident=False,
     )
     buf = torch.zeros(cache_tensor.size, dtype=torch.int8, device=device)
-    views = create_kv_cache_views(
-        buf, spec, num_blocks, layout, cache_tensor, kernel_block_size=alloc_block_size
-    )
+    views = create_kv_cache_views(buf, spec, num_blocks, layout, cache_tensor, kernel_block_size=alloc_block_size)
     registered.bind_kv_cache(views[0])
     print(
         f"  [{layer_obj.prefix}] backend={registered.get_attn_backend().get_name()} "
@@ -710,9 +705,7 @@ def _build_metadata_and_bind_caches(attn_module: DeepseekV4XPUAttention, vllm_co
         spec = registered.get_kv_cache_spec(vllm_config)
         if spec is None:
             continue
-        state_blocks = _cache_blocks_for_block_size(
-            int(common.num_reqs), real_max_seq, spec.block_size
-        )
+        state_blocks = _cache_blocks_for_block_size(int(common.num_reqs), real_max_seq, spec.block_size)
         state_metadata = _alloc_and_build_layer_cache(
             state_cache,
             registered,
@@ -749,16 +742,10 @@ def _decode_pack_n(*, state_bytes: int) -> int:
     """Graph-replay packing for decode: pow2 1..64.
 
     Amortizes per-replay launch overhead against the op's own per-call traffic;
-    the window follows COLLECTOR_SYSTEM (gdn precedent), overridable via
-    ``aic_dsv4_launch_amortize_bytes``.
+    the window follows COLLECTOR_SYSTEM (gdn precedent).
     """
     system = os.environ.get("COLLECTOR_SYSTEM") or None
-    amortize = int(
-        os.getenv(
-            "aic_dsv4_launch_amortize_bytes",
-            str(_LAUNCH_AMORTIZE_BYTES.get(system, _LAUNCH_AMORTIZE_BYTES_DEFAULT)),
-        )
-    )
+    amortize = _LAUNCH_AMORTIZE_BYTES.get(system, _LAUNCH_AMORTIZE_BYTES_DEFAULT)
     raw = min(float(_PACK_N_MAX), max(1.0, amortize / max(state_bytes, 1)))
     return min(_PACK_N_MAX, max(1, 1 << round(math.log2(raw))))
 
@@ -782,10 +769,7 @@ def _context_timing_mode() -> str:
     if mode == "pack":
         return "eager_pack"
     if mode not in _CONTEXT_TIMING_MODES:
-        raise RuntimeError(
-            f"unknown AIC_DSV4_PREFILL_TIMING={mode!r}; "
-            f"expected {' | '.join(_CONTEXT_TIMING_MODES)}"
-        )
+        raise RuntimeError(f"unknown AIC_DSV4_PREFILL_TIMING={mode!r}; expected {' | '.join(_CONTEXT_TIMING_MODES)}")
     return mode
 
 
@@ -835,9 +819,7 @@ def _bench_attention_shape(
     query_len = seq_len if is_context else 1
     # Single-token batches (decode, isl=1 prefill) take the decode path, whose
     # capture-time metadata widths follow max_model_len (serving parity).
-    serving_max_model_len = SERVING_MAX_MODEL_LEN or int(
-        _read_model_config(model_path)["max_position_embeddings"]
-    )
+    serving_max_model_len = SERVING_MAX_MODEL_LEN or int(_read_model_config(model_path)["max_position_embeddings"])
     max_model_len = max(metadata_seq_len, serving_max_model_len if query_len == 1 else 4096)
     # Context timing via AIC_DSV4_PREFILL_TIMING (default "graph" = production
     # verdict, see _context_timing_mode): then "graph" means the vLLM-XPU V1
@@ -957,9 +939,7 @@ def _bench_attention_shape(
                     timing_label = "eager_repeat10"
                     run = kernel_func
                 elif prefill_timing_mode == "eager_pack":
-                    pack_n = _decode_pack_n(
-                        state_bytes=batch_size * seq_len * kv_bytes_per_token
-                    )
+                    pack_n = _decode_pack_n(state_bytes=batch_size * seq_len * kv_bytes_per_token)
                     repeat_n = 1
                     timing_label = f"eager_pack{pack_n}"
 
@@ -979,9 +959,7 @@ def _bench_attention_shape(
                 # the sliding window from the SWA cache, both in the same
                 # per-token bytes (framework spec at runtime, never hardcoded).
                 state_bytes = (
-                    batch_size
-                    * (int(hf_config.index_topk) + int(hf_config.sliding_window))
-                    * kv_bytes_per_token
+                    batch_size * (int(hf_config.index_topk) + int(hf_config.sliding_window)) * kv_bytes_per_token
                 )
                 pack_n = _decode_pack_n(state_bytes=state_bytes)
                 repeat_n = 1
@@ -1342,9 +1320,7 @@ def _bench_sparse_kernel_shape(
                 "compress_ratio": ATTN_KIND_TO_COMPRESS_RATIO[attn_kind],
                 "latency": f"{latency:.4f}",
                 "used_cuda_graph": result.get("used_cuda_graph", False),
-                "timing_mode": (
-                    "graph_pack" if result.get("used_cuda_graph", False) else "eager_repeat10"
-                ),
+                "timing_mode": ("graph_pack" if result.get("used_cuda_graph", False) else "eager_repeat10"),
             }
         ],
         framework="VLLM",

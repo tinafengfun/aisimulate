@@ -16,15 +16,14 @@ import os
 import time
 
 import torch
+from collector.case_generator import get_gemm_case_specs, get_gemm_type_specs
+from collector.helper import benchmark_with_power, get_device_module, log_perf, xpu_graph_measure_enabled
+from collector.vllm.utils_xpu import create_vllm_config, setup_distributed, with_exit_stack
 from vllm.config import set_current_vllm_config
 from vllm.model_executor.layers.linear import RowParallelLinear
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.utils.deep_gemm import per_block_cast_to_fp8
 from vllm.version import __version__ as vllm_version
-
-from collector.case_generator import get_gemm_case_specs, get_gemm_type_specs
-from collector.helper import benchmark_with_power, get_device_module, log_perf, xpu_graph_measure_enabled
-from collector.vllm.utils_xpu import create_vllm_config, setup_distributed, with_exit_stack
 
 FP8_BLOCK_SHAPE = (128, 128)
 
@@ -134,9 +133,7 @@ def get_gemm_test_cases():
 
 def _get_loop_mem_budget_fraction() -> float:
     system = os.environ.get("COLLECTOR_SYSTEM") or None
-    return _LOOP_MEM_BUDGET_FRACTION_BY_SYSTEM.get(
-        system, _LOOP_MEM_BUDGET_FRACTION_BY_SYSTEM["b60"]
-    )
+    return _LOOP_MEM_BUDGET_FRACTION_BY_SYSTEM.get(system, _LOOP_MEM_BUDGET_FRACTION_BY_SYSTEM["b60"])
 
 
 def _get_max_ops_per_graph() -> int:

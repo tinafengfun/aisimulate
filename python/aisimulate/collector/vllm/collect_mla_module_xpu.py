@@ -24,12 +24,6 @@ import traceback
 from pathlib import Path
 
 import torch
-from vllm.config import set_current_vllm_config
-from vllm.forward_context import set_forward_context
-from vllm.transformers_utils.config import _CONFIG_REGISTRY
-from vllm.v1.worker.workspace import init_workspace_manager
-from vllm.version import __version__ as vllm_version
-
 from collector.case_generator import get_xpu_mla_module_test_cases
 from collector.helper import (
     benchmark_with_power,
@@ -45,6 +39,11 @@ from collector.vllm.utils_xpu import (
     setup_distributed,
     with_exit_stack,
 )
+from vllm.config import set_current_vllm_config
+from vllm.forward_context import set_forward_context
+from vllm.transformers_utils.config import _CONFIG_REGISTRY
+from vllm.v1.worker.workspace import init_workspace_manager
+from vllm.version import __version__ as vllm_version
 
 # vLLM registers GlmMoeDsaForCausalLM but omits the "glm_moe_dsa" config-type
 # mapping; the layout matches DeepSeek-V3, so reuse DeepseekV3Config.
@@ -310,7 +309,9 @@ def _create_kv_cache_and_metadata(vllm_config, attn_type, batch_size, seq_len, i
         indexer_builder = indexer_builder_cls(
             indexer_spec, [indexer_layer_name], vllm_config, torch.device(device), **builder_kwargs
         )
-        indexer_metadata = indexer_builder.build(common_prefix_len=prefix_len, common_attn_metadata=common_attn_metadata)
+        indexer_metadata = indexer_builder.build(
+            common_prefix_len=prefix_len, common_attn_metadata=common_attn_metadata
+        )
         _populate_indexer_kv_cache(indexer_kv_cache, common_attn_metadata, [t.shape[0] for t in kv_c_contexts])
 
     return kv_cache, attn_metadata, indexer_kv_cache, indexer_metadata
@@ -362,9 +363,7 @@ def run_mla_module(
     # ctx-dsa at bs>=8 + isl>=16384 triggers an uncorrectable GPU compute fault
     # (device-lost / wedged). Skipped by default; set SKIP_HW_FAULT_CONFIGS=0 to
     # force-run (will likely wedge the GPU and need a reboot).
-    _hw_fault_config = (
-        attn_type == "dsa" and is_context and batch_size >= 8 and seq_len >= 16384
-    )
+    _hw_fault_config = attn_type == "dsa" and is_context and batch_size >= 8 and seq_len >= 16384
     if _hw_fault_config and os.environ.get("SKIP_HW_FAULT_CONFIGS", "1") not in (
         "0",
         "false",

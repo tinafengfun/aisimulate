@@ -258,7 +258,6 @@ REGISTRY_XPU: list[OpEntry] = [
     ),
     # DSV4 attention (XPU port of collect_dsv4_attn): same op/get/run names as the CUDA entries.
     # swa = sliding-window-only layers (compress_ratios == 0); the sparse-kernel ops have no swa equivalent.
-
     OpEntry(
         op="dsv4_csa_context_module",
         module="collector.vllm.collect_dsv4_attn_xpu",

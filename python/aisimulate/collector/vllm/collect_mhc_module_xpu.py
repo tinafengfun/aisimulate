@@ -30,8 +30,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import torch
-from vllm.version import __version__ as vllm_version
-
 from collector.case_generator import get_xpu_mhc_module_test_cases
 from collector.helper import (
     EXIT_CODE_RESTART,
@@ -42,6 +40,7 @@ from collector.helper import (
 )
 from collector.registry_types import PerfFile
 from collector.vllm.utils_xpu import setup_distributed
+from vllm.version import __version__ as vllm_version
 
 DEFAULT_HIDDEN_SIZE = 4096
 DEFAULT_HC_MULT = 4
@@ -61,6 +60,7 @@ _PACK_N_MAX = 64
 _RECYCLE_BYTES = 1_000_000_000
 
 _DEEPKLOX_KERNELS: tuple | None = None
+
 
 def _deepklox_kernels():
     global _DEEPKLOX_KERNELS
@@ -131,7 +131,7 @@ def _make_mhc_tensors(num_tokens: int, hidden_size: int, hc_mult: int, *, device
 
 def _mhc_pack_n(num_tokens: int, hidden_size: int, hc_mult: int) -> int:
     """Op calls to pack per graph capture: working-set bytes vs the window, pow2 1..64."""
-    window = int(os.getenv("aic_mhc_launch_amortize_bytes", str(_PACK_WINDOW_BYTES)))
+    window = _PACK_WINDOW_BYTES
     per_call_bytes = MHC_NUM_SITES * num_tokens * hc_mult * hidden_size * 2  # bf16 residual
     raw = min(float(_PACK_N_MAX), max(1.0, window / max(per_call_bytes, 1)))
     return min(_PACK_N_MAX, max(1, 1 << round(math.log2(raw))))

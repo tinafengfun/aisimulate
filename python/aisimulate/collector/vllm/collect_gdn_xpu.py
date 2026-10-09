@@ -22,8 +22,6 @@ import os
 
 import torch
 import vllm_xpu_kernels._xpu_C  # noqa: F401  (registers torch.ops._xpu_C)
-from vllm.version import __version__ as vllm_version
-
 from collector.case_generator import get_xpu_gdn_test_cases
 from collector.helper import (
     benchmark_with_power,
@@ -31,6 +29,7 @@ from collector.helper import (
     log_perf,
     xpu_graph_measure_enabled,
 )
+from vllm.version import __version__ as vllm_version
 
 aic_debug = int(os.getenv("aic_gdn_debug", "0"))  # noqa: SIM112
 
@@ -86,12 +85,7 @@ def _grid_y(phase, batch_size, num_tokens, num_v_heads):
 def _decode_pack_n(common_log_data):
     """Kernels to pack per decode graph: fp32 ssm-state bytes vs amortize threshold, pow2 1..64."""
     system = os.environ.get("COLLECTOR_SYSTEM") or None
-    amortize = int(
-        os.getenv(
-            "aic_gdn_launch_amortize_bytes",
-            str(_LAUNCH_AMORTIZE_BYTES.get(system, _LAUNCH_AMORTIZE_BYTES_DEFAULT)),
-        )
-    )
+    amortize = _LAUNCH_AMORTIZE_BYTES.get(system, _LAUNCH_AMORTIZE_BYTES_DEFAULT)
     state_bytes = (
         common_log_data["batch_size"]
         * common_log_data["num_v_heads"]
@@ -196,8 +190,7 @@ def _run_phase(
                 # skip: kernel grid-y exceeds the hardware limit -> uncatchable
                 # DEVICE_LOST (see _GRID_Y_LIMIT note). Not a memory issue.
                 print(
-                    f"GDN {phase} skip {model_name} bs={batch_size} seq={seq_len} "
-                    f"(grid_y={grid_y} > {_GRID_Y_LIMIT})"
+                    f"GDN {phase} skip {model_name} bs={batch_size} seq={seq_len} (grid_y={grid_y} > {_GRID_Y_LIMIT})"
                 )
                 continue
             if phase == "context":
