@@ -3,15 +3,14 @@
 
 """vLLM-XPU (CRI) Qwen3.5 Gated DeltaNet collector.
 
-XPU exposes GDN through a single fused kernel, ``gdn_attention`` in
-``vllm_xpu_kernels._xpu_C``, that applies the packed-QKV depthwise convolution
-and the recurrent/chunked scan in one SYCL launch and dispatches prefill vs
-decode from the ``num_prefills``/``num_decodes`` counts. This is exactly the op
-vLLM-XPU serving runs (``torch.ops.vllm.gdn_attention_core_xpu`` wraps it), so
-the collector times that same fused op to record the true production latency --
-rather than summing the separately-exposed ``causal_conv1d`` and
-``gated_delta_rule`` stages. Input/output projection GEMMs stay with the GEMM
-collector.
+Times the two production core ops separately, matching the NVIDIA collector:
+the packed-QKV depthwise convolution and the gated-delta-rule scan. Context
+uses ``causal_conv1d_fn`` + ``chunk_gated_delta_rule``; generation uses
+``causal_conv1d_update`` + ``gated_delta_rule_decode``. Input/output projection
+GEMMs stay with the GEMM collector.
+
+The per-op GDN primitives are imported from vLLM-XPU's
+``mamba.gdn.deepklox_interface``, which dispatches each op to DeepKLOX for now
 """
 
 __compat__ = "vllm==0.28.0"
@@ -21,7 +20,15 @@ import math
 import os
 
 import torch
-import vllm_xpu_kernels._xpu_C  # noqa: F401  (registers torch.ops._xpu_C)
+from vllm.model_executor.layers.mamba.gdn.deepklox_interface import (
+    causal_conv1d_fn,
+    causal_conv1d_update,
+    chunk_gated_delta_rule,
+    gated_delta_rule_decode,
+    gdn_prefill_backend,
+)
+from vllm.version import __version__ as vllm_version
+
 from collector.case_generator import get_xpu_gdn_test_cases
 from collector.helper import (
     benchmark_with_power,
@@ -29,7 +36,6 @@ from collector.helper import (
     log_perf,
     xpu_graph_measure_enabled,
 )
-from vllm.version import __version__ as vllm_version
 
 aic_debug = int(os.getenv("aic_gdn_debug", "0"))  # noqa: SIM112
 
@@ -38,6 +44,8 @@ aic_debug = int(os.getenv("aic_gdn_debug", "0"))  # noqa: SIM112
 # DEVICE_LOST that kills the worker), so pre-skip offending shapes.
 _GRID_Y_LIMIT = int(os.getenv("aic_gdn_grid_y_limit", str(65535)))  # noqa: SIM112
 _CTX_CHUNK = 128  # chunk length of the context (prefill) scan kernel
+_CTX_SEQ_MULTIPLE = 64  # Xe3p prefill conv requires each sequence length divisible by 64
+_CONV_ELEM_LIMIT = 2**31  # packed conv (num_tokens*conv_dim) element ceiling; NV int32-offset parity
 
 # Per COLLECTOR_SYSTEM: CRI needs the larger window, b60 keeps the smaller default.
 _LAUNCH_AMORTIZE_BYTES = {"cri": 340_000_000}
@@ -64,13 +72,11 @@ def get_gdn_test_cases():
     ]
 
 
-def _mixed_sizes(num_k_heads, num_v_heads, head_k_dim, head_v_dim):
-    """Packed projection widths the XPU kernel expects (tp-local, tp_size=1)."""
-    vpk = num_v_heads // num_k_heads  # v-heads per k-head
-    mixed_qkvz = num_k_heads * (2 * head_k_dim + 2 * head_v_dim * vpk)
-    mixed_ba = num_k_heads * (2 * vpk)
-    mixed_qkv = num_k_heads * (2 * head_k_dim + head_v_dim * vpk)  # conv dim
-    return mixed_qkvz, mixed_ba, mixed_qkv
+def _conv_dim(num_k_heads, num_v_heads, head_k_dim, head_v_dim):
+    """Packed-QKV convolution width: q and k each span key_dim, v spans value_dim."""
+    key_dim = num_k_heads * head_k_dim
+    value_dim = num_v_heads * head_v_dim
+    return 2 * key_dim + value_dim
 
 
 def _grid_y(phase, batch_size, num_tokens, num_v_heads):
@@ -158,26 +164,24 @@ def _run_phase(
     perf_filename,
     device,
 ):
-    """Shared driver: build inputs then time conv + scan for each shape."""
+    """Shared driver: time conv then scan separately for each shape."""
     device = torch.device(device)
     get_device_module().set_device(device)
     torch.set_default_device(device)
 
     dtype = torch.bfloat16
-    mixed_qkvz, mixed_ba, mixed_qkv = _mixed_sizes(num_k_heads, num_v_heads, head_k_dim, head_v_dim)
-    # tp-local head counts already; pass tp_size=1 so the kernel keeps them.
-    tp_size = 1
-    conv_weights = torch.randn(mixed_qkv, d_conv, dtype=dtype, device=device)
-    conv_bias = None  # Qwen3.5 depthwise conv is bias=False
-    a_log = torch.zeros(num_v_heads, dtype=torch.float32, device=device)
-    dt_bias = torch.zeros(num_v_heads, dtype=dtype, device=device)
+    conv_dim = _conv_dim(num_k_heads, num_v_heads, head_k_dim, head_v_dim)
+    taps = d_conv - 1  # conv-state history length
+    scale = head_k_dim**-0.5
+    backend = gdn_prefill_backend(device)  # prefill scan specialization (xe3p/xe2)
+    conv_weight = torch.randn(conv_dim, d_conv, dtype=dtype, device=device)
 
     # context: seq_len sub-sweep; generation: single token per request.
     seq_iter = seq_len_list if phase == "context" else [1]
 
     if aic_debug:
         print(
-            f"GDN {phase}: d_model={d_model}, mixed_qkv={mixed_qkv}, "
+            f"GDN {phase}: d_model={d_model}, conv_dim={conv_dim}, backend={backend}, "
             f"num_k_heads={num_k_heads}, head_k_dim={head_k_dim}, "
             f"num_v_heads={num_v_heads}, head_v_dim={head_v_dim}"
         )
@@ -185,40 +189,22 @@ def _run_phase(
     for batch_size in batch_size_list:
         for seq_len in seq_iter:
             num_tokens = batch_size * seq_len
-            grid_y = _grid_y(phase, batch_size, num_tokens, num_v_heads)
-            if grid_y > _GRID_Y_LIMIT:
-                # skip: kernel grid-y exceeds the hardware limit -> uncatchable
-                # DEVICE_LOST (see _GRID_Y_LIMIT note). Not a memory issue.
+            if phase == "context" and seq_len % _CTX_SEQ_MULTIPLE:
+                # Xe3p prefill conv rejects sequence lengths not divisible by 64;
+                # skip the whole cell (conv + scan) rather than measure half of it.
                 print(
-                    f"GDN {phase} skip {model_name} bs={batch_size} seq={seq_len} (grid_y={grid_y} > {_GRID_Y_LIMIT})"
+                    f"GDN {phase} skip {model_name} bs={batch_size} seq={seq_len} (seq_len % {_CTX_SEQ_MULTIPLE} != 0)"
                 )
                 continue
-            if phase == "context":
-                num_prefills, num_decodes = batch_size, 0
-                # fresh prompts: no prior conv/ssm state
-                conv_state = torch.zeros(batch_size + 1, d_conv - 1, mixed_qkv, dtype=dtype, device=device)
-                ssm_state = torch.zeros(
-                    batch_size + 1, num_v_heads, head_v_dim, head_k_dim, dtype=torch.float32, device=device
+            if phase == "context" and num_tokens * conv_dim >= _CONV_ELEM_LIMIT:
+                # packed conv input has num_tokens*conv_dim elements; past 2**31 the
+                # allocation balloons to tens of GB and stalls the device (NV raises
+                # the same cell on its int32 kernel-offset overflow). Skip the cell.
+                print(
+                    f"GDN {phase} skip {model_name} bs={batch_size} seq={seq_len} "
+                    f"(num_tokens*conv_dim={num_tokens * conv_dim} >= {_CONV_ELEM_LIMIT})"
                 )
-                has_initial_state = torch.zeros(batch_size, dtype=torch.bool, device=device)
-            else:
-                num_prefills, num_decodes = 0, batch_size
-                # decode continues from cached state
-                conv_state = torch.randn(batch_size + 1, d_conv - 1, mixed_qkv, dtype=dtype, device=device)
-                ssm_state = torch.randn(
-                    batch_size + 1, num_v_heads, head_v_dim, head_k_dim, dtype=torch.float32, device=device
-                )
-                has_initial_state = torch.ones(batch_size, dtype=torch.bool, device=device)
-
-            # equal token split per request; slot 0 is vLLM's null block
-            query_start_loc = torch.arange(0, num_tokens + 1, seq_len, dtype=torch.int32, device=device)
-            state_indices = torch.arange(1, batch_size + 1, dtype=torch.int32, device=device)
-
-            projected_states_qkvz = torch.randn(num_tokens, mixed_qkvz, dtype=dtype, device=device)
-            projected_states_ba = torch.randn(num_tokens, mixed_ba, dtype=dtype, device=device)
-            core_attn_out = torch.zeros(num_tokens, num_v_heads, head_v_dim, dtype=dtype, device=device)
-            z = torch.empty_like(core_attn_out)
-
+                continue
             common_log_data = {
                 "phase": phase,
                 "batch_size": batch_size,
@@ -232,51 +218,158 @@ def _run_phase(
                 "head_v_dim": head_v_dim,
                 "model_name": model_name,
             }
+            # slot 0 is vLLM's null block; one live slot per request.
+            state_indices = torch.arange(1, batch_size + 1, dtype=torch.int32, device=device)
 
-            # Mirror serving: one fused gdn_attention launch (conv + scan in a
-            # single SYCL kernel), exactly as vLLM-XPU calls it at
-            # vllm/_xpu_ops.py (torch.ops.vllm.gdn_attention_core_xpu wraps this
-            # op). Timing the fused op gives the true production latency rather
-            # than a sum of two separately-launched stages.
-            def run_gdn():
-                torch.ops._xpu_C.gdn_attention(
-                    core_attn_out,
-                    z,
-                    projected_states_qkvz,
-                    projected_states_ba,
-                    num_k_heads,
-                    num_v_heads,
-                    head_k_dim,
-                    head_v_dim,
-                    conv_state=conv_state,
-                    ssm_state=ssm_state,
-                    conv_weights=conv_weights,
-                    conv_bias=conv_bias,
-                    activation="silu",
-                    A_log=a_log,
-                    dt_bias=dt_bias,
-                    num_prefills=num_prefills,
-                    num_decodes=num_decodes,
-                    num_spec_decodes=0,
-                    has_initial_state=has_initial_state,
-                    non_spec_query_start_loc=query_start_loc,
-                    non_spec_token_indx=None,
-                    non_spec_state_indices_tensor=state_indices,
-                    spec_query_start_loc=None,
-                    spec_token_indx=None,
-                    spec_state_indices_tensor=None,
-                    num_accepted_tokens=None,
-                    num_actual_tokens=num_tokens,
-                    tp_size=tp_size,
-                    reorder_input=False,
+            if phase == "context":
+                # Conv: packed-QKV depthwise conv over the prompt. vLLM layout:
+                # feature-contiguous [conv_dim, tokens] input, paged conv-state
+                # cache with unit channel stride.
+                conv_x = torch.randn(num_tokens, conv_dim, dtype=dtype, device=device).transpose(0, 1)
+                conv_states = torch.zeros(batch_size + 1, taps, conv_dim, dtype=dtype, device=device).transpose(-1, -2)
+                has_initial_state = torch.zeros(batch_size, dtype=torch.bool, device=device)
+                query_start_loc = torch.arange(0, num_tokens + 1, seq_len, dtype=torch.int32, device=device)
+
+                # q and k occupy key_dim, so conv q-heads mirror the k-heads;
+                # l2norm is left to the scan to avoid double-normalizing.
+                def run_conv(_x=conv_x, _st=conv_states, _qsl=query_start_loc, _has=has_initial_state):
+                    causal_conv1d_fn(
+                        _x,
+                        conv_weight,
+                        None,
+                        "silu",
+                        _st,
+                        state_indices,
+                        _has,
+                        _qsl,
+                        apply_qkv_split=True,
+                        num_q_heads=num_k_heads,
+                        num_k_heads=num_k_heads,
+                        num_v_heads=num_v_heads,
+                        head_q_dim=head_k_dim,
+                        head_k_dim=head_k_dim,
+                        head_v_dim=head_v_dim,
+                        apply_l2norm=False,
+                    )
+
+                _benchmark(run_conv, device, common_log_data, "causal_conv1d_fn", perf_filename, phase=phase)
+                del conv_x, conv_states, has_initial_state, query_start_loc
+                gc.collect()
+                get_device_module().empty_cache()
+
+                grid_y = _grid_y(phase, batch_size, num_tokens, num_v_heads)
+                if grid_y > _GRID_Y_LIMIT:
+                    # scan grid-y exceeds the hardware limit -> uncatchable
+                    # DEVICE_LOST (see _GRID_Y_LIMIT note). Conv is still logged.
+                    print(
+                        f"GDN {phase} scan skip {model_name} bs={batch_size} "
+                        f"seq={seq_len} (grid_y={grid_y} > {_GRID_Y_LIMIT})"
+                    )
+                    continue
+
+                # Scan: chunked gated-delta-rule. q/k span head_k_dim, v spans
+                # head_v_dim; g/beta are already exp/sigmoid-space per v-head.
+                q = torch.randn(num_tokens, num_k_heads, head_k_dim, dtype=dtype, device=device)
+                k = torch.randn(num_tokens, num_k_heads, head_k_dim, dtype=dtype, device=device)
+                v = torch.randn(num_tokens, num_v_heads, head_v_dim, dtype=dtype, device=device)
+                g = (0.8 + 0.2 * torch.rand(num_tokens, num_v_heads, device=device)).float()
+                beta = torch.sigmoid(torch.randn(num_tokens, num_v_heads, device=device)).float()
+                cu_seqlens = torch.arange(0, num_tokens + 1, seq_len, dtype=torch.int64, device=device)
+
+                def run_scan(_q=q, _k=k, _v=v, _g=g, _beta=beta, _cu=cu_seqlens):
+                    chunk_gated_delta_rule(
+                        _q,
+                        _k,
+                        _v,
+                        _g,
+                        _beta,
+                        scale=scale,
+                        cu_seqlens=_cu,
+                        output_final_state=True,
+                        use_qk_l2norm_in_kernel=backend == "xe3p",
+                    )
+
+                _benchmark(
+                    run_scan,
+                    device,
+                    common_log_data,
+                    f"chunk_gated_delta_rule_{backend}",
+                    perf_filename,
+                    phase=phase,
+                )
+                del q, k, v, g, beta, cu_seqlens
+                gc.collect()
+                get_device_module().empty_cache()
+            else:
+                # Conv: single-token packed-QKV conv update against cached state.
+                conv_x = torch.randn(batch_size, conv_dim, dtype=dtype, device=device)
+                conv_state = torch.randn(batch_size + 1, taps, conv_dim, dtype=dtype, device=device).transpose(-1, -2)
+
+                # Xe3p decode conv runs only no-split (split update is rejected);
+                # the kernel processes the packed conv_dim channels directly.
+                def run_conv(_x=conv_x, _st=conv_state):
+                    causal_conv1d_update(
+                        _x,
+                        _st,
+                        conv_weight,
+                        None,
+                        "silu",
+                        state_indices,
+                        apply_qkv_split=False,
+                        num_q_heads=num_k_heads,
+                        num_k_heads=num_k_heads,
+                        num_v_heads=num_v_heads,
+                        head_q_dim=head_k_dim,
+                        head_k_dim=head_k_dim,
+                        head_v_dim=head_v_dim,
+                        apply_l2norm=False,
+                    )
+
+                _benchmark(run_conv, device, common_log_data, "causal_conv1d_update", perf_filename, phase=phase)
+                del conv_x, conv_state
+                gc.collect()
+                get_device_module().empty_cache()
+
+                grid_y = _grid_y(phase, batch_size, num_tokens, num_v_heads)
+                if grid_y > _GRID_Y_LIMIT:
+                    # scan grid-y exceeds the hardware limit -> uncatchable
+                    # DEVICE_LOST (see _GRID_Y_LIMIT note). Conv is still logged.
+                    print(f"GDN {phase} scan skip {model_name} bs={batch_size} (grid_y={grid_y} > {_GRID_Y_LIMIT})")
+                    continue
+
+                # Scan: recurrent decode. gating (a/b/A_log/dt_bias) is fused in
+                # the kernel; the fp32 ssm-state pool is V-major [HV, V, K].
+                q = torch.randn(batch_size, 1, num_k_heads, head_k_dim, dtype=dtype, device=device)
+                k = torch.randn(batch_size, 1, num_k_heads, head_k_dim, dtype=dtype, device=device)
+                v = torch.randn(batch_size, 1, num_v_heads, head_v_dim, dtype=dtype, device=device)
+                a_log = torch.randn(num_v_heads, dtype=torch.float32, device=device)
+                dt_bias = torch.randn(num_v_heads, dtype=torch.float32, device=device)
+                a = torch.randn(batch_size, 1, num_v_heads, dtype=dtype, device=device)
+                b = torch.randn(batch_size, 1, num_v_heads, dtype=dtype, device=device)
+                ssm_state = torch.randn(
+                    batch_size + 1, num_v_heads, head_v_dim, head_k_dim, dtype=torch.float32, device=device
                 )
 
-            _benchmark(run_gdn, device, common_log_data, "gdn_attention", perf_filename, phase=phase)
+                def run_scan(_q=q, _k=k, _v=v, _a=a, _b=b, _st=ssm_state):
+                    gated_delta_rule_decode(
+                        q=_q,
+                        k=_k,
+                        v=_v,
+                        state=None,
+                        A_log=a_log,
+                        a=_a,
+                        dt_bias=dt_bias,
+                        b=_b,
+                        scale=scale,
+                        use_qk_l2norm=True,
+                        initial_state=_st,
+                        initial_state_indices=state_indices,
+                    )
 
-            del projected_states_qkvz, projected_states_ba
-            del core_attn_out, z, conv_state, ssm_state
-            gc.collect()
-            get_device_module().empty_cache()
+                _benchmark(run_scan, device, common_log_data, "gated_delta_rule_decode", perf_filename, phase=phase)
+                del q, k, v, a_log, dt_bias, a, b, ssm_state
+                gc.collect()
+                get_device_module().empty_cache()
 
 
 def run_gdn_torch(
