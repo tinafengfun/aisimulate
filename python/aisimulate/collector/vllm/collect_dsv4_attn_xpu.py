@@ -84,7 +84,6 @@ import os as _os_pre
 _os_pre.environ.setdefault("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
 
 import torch
-import vllm.envs as vllm_envs
 import vllm_xpu_kernels._xpu_C  # noqa: F401
 from collector.case_generator import (
     _DSV4_DEFAULT_MODELS,
@@ -174,6 +173,9 @@ CONTEXT_STATIC_BYTES = 8 * 2**30
 # VLLM_XPU_MXFP8_USE_SYCLTLA=1: deepklox's GEMM takes an fp32 [M, N] workspace,
 # ~2 KiB per local head and token (2.5 measured, with allocator fragmentation).
 SYCLTLA_KIB_PER_LOCAL_HEAD = 2.5
+# Not a registered vllm env var (vllm.envs.__getattr__ raises AttributeError for
+# it), so read it straight from the environment rather than via vllm_envs.
+_USE_SYCLTLA = os.environ.get("VLLM_XPU_MXFP8_USE_SYCLTLA", "1").lower() in ("1", "true", "yes")
 # An XPU OOM surfaces as UR_RESULT_ERROR_DEVICE_LOST (not OutOfMemoryError), so
 # stay below it.
 MAX_MEM_FRACTION = 0.9
@@ -335,7 +337,7 @@ def _context_exceeds_memory(model_path: str, attn_kind: str, batch_size: int, qu
     """Generation-time memory-feasibility filter (the one sanctioned in-collector
     filter: size vs capacity, counted + logged — see _get_test_cases)."""
     hidden_bytes = 2 * int(_read_model_config(model_path)["hidden_size"])
-    kib_per_head = 2 + (SYCLTLA_KIB_PER_LOCAL_HEAD if vllm_envs.VLLM_XPU_MXFP8_USE_SYCLTLA else 0)
+    kib_per_head = 2 + (SYCLTLA_KIB_PER_LOCAL_HEAD if _USE_SYCLTLA else 0)
     per_token = (
         hidden_bytes
         + (kib_per_head * _local_num_heads(model_path, tp_size) + CONTEXT_EXTRA_KIB_PER_TOKEN[attn_kind]) * 1024
