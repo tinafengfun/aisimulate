@@ -2738,6 +2738,24 @@ _DSV4_SPARSE_PAST_KV_LIST = _as_int_list(
 )
 _DSV4_SPARSE_CHUNK_PREFILL_SIZE = int(_DSV4_CONFIG["sparse_chunk_prefill_size"])
 _DSV4_SPARSE_MAX_FULL_S = int(_DSV4_CONFIG["sparse_max_full_sequence_length"])
+
+
+def _dsv4_sparse_max_query_tokens(config: dict) -> int | None:
+    """Serving single-step query-token budget for the sparse-kernel ops:
+    serving caps query tokens per scheduler step at max-num-batched-tokens
+    (8192, serve_dsv4.sh), mirrored by the NV baseline cap
+    (collect_dsv4_attn.py MAX_SPARSE_QUERY_TOKENS). Declared explicitly;
+    null disables the cap.
+    """
+    if "sparse_max_query_tokens" not in config:
+        raise RuntimeError(
+            "dsv4.sparse_max_query_tokens must be declared explicitly (integer or null = no cap)"
+        )
+    value = config["sparse_max_query_tokens"]
+    return None if value is None else int(value)
+
+
+_DSV4_SPARSE_MAX_QUERY_TOKENS = _dsv4_sparse_max_query_tokens(_DSV4_CONFIG)
 _DSV4_SPARSE_TP_SIZES = _required_mapping(_DSV4_CONFIG["sparse_tp_sizes"], field_name="dsv4.sparse_tp_sizes")
 _DSV4_SPARSE_TP_LIST_ATTN = _as_int_list(
     _DSV4_SPARSE_TP_SIZES["hca_attn"],
@@ -3123,17 +3141,28 @@ def _xpu_dsv4_sparse_rows(kernel: str) -> list[list]:
         ]
 
     cases: list[list] = []
+    dropped_query_tokens = 0
     for model_path in model_paths:
         for tp_size in tp_list:
             for bs in _DSV4_SPARSE_BS_LIST:
                 for isl in _DSV4_SPARSE_ISL_LIST:
-                    if bs * isl > _DSV4_XPU_MAX_SPARSE_QUERY_TOKENS:
-                        continue
                     for past_kv in _DSV4_SPARSE_PAST_KV_LIST:
+                        if (
+                            _DSV4_SPARSE_MAX_QUERY_TOKENS is not None
+                            and bs * isl > _DSV4_SPARSE_MAX_QUERY_TOKENS
+                        ):
+                            dropped_query_tokens += 1
+                            continue
                         full_s = isl + past_kv
                         if bs * full_s > _DSV4_SPARSE_MAX_FULL_S:
                             continue
                         cases.append([bs, isl, past_kv, tp_size, kernel, model_path])
+    if dropped_query_tokens:
+        print(
+            f"[dsv4-test-cases] xpu_dsv4_{kernel}: dropped {dropped_query_tokens} case(s) "
+            f"(sparse_max_query_tokens={_DSV4_SPARSE_MAX_QUERY_TOKENS})",
+            flush=True,
+        )
     return cases
 
 

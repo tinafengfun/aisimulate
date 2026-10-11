@@ -402,6 +402,10 @@ model_case_values:
       - 262144
       - 524288
       - 1048575
+    # Serving single-step query-token budget for the sparse-kernel ops:
+    # max-num-batched-tokens=8192 (serve_dsv4.sh), mirrored by the NV baseline
+    # cap (collect_dsv4_attn.py MAX_SPARSE_QUERY_TOKENS). null = no cap.
+    sparse_max_query_tokens: 8192
     sparse_chunk_prefill_size: 8192
     sparse_max_full_sequence_length: 1048576
     sparse_tp_sizes:
