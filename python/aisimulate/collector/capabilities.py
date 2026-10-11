@@ -20,13 +20,20 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from pathlib import Path
 
 import yaml
 
 logger = logging.getLogger(__name__)
 
-_CASES_DIR = Path(__file__).resolve().parent / "cases"
+# Same override as case_generator.py (AIC_COLLECTOR_CASES_ROOT): capabilities
+# and denylist ride the pinned snapshot so floors match the pinned case set.
+_CASES_ROOT_OVERRIDE = os.environ.get("AIC_COLLECTOR_CASES_ROOT")
+if _CASES_ROOT_OVERRIDE:
+    _CASES_DIR = Path(_CASES_ROOT_OVERRIDE) / "collector" / "cases"
+else:
+    _CASES_DIR = Path(__file__).resolve().parent / "cases"
 
 # Case attribute names that carry a dtype/quantization mode.
 _DTYPE_FIELDS = ("moe_type", "gemm_type", "dtype", "kv_cache_dtype", "compute_dtype")

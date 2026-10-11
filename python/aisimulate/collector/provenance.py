@@ -22,6 +22,7 @@ or loading raises ``KeyError``.
 from __future__ import annotations
 
 import hashlib
+import os
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -170,13 +171,24 @@ def _expand_closure_files(repo_root: Path, extras: list[str]) -> set[str]:
     files: set[str] = set()
     for extra in extras:
         if extra == MODEL_CASES_GROUP:
+            # Relpath keys stay repo-relative under the override too: only the
+            # bytes change, so hashes remain comparable across roots.
             files.update(
-                str(model_cases_file.relative_to(repo_root))
-                for model_cases_file in sorted((repo_root / _MODEL_CASES_DIR).glob("*.yaml"))
+                f"{_MODEL_CASES_DIR}/{model_cases_file.name}"
+                for model_cases_file in sorted((_cases_root(repo_root) / _MODEL_CASES_DIR).glob("*.yaml"))
             )
         else:
             files.add(extra)
     return files
+
+
+def _cases_root(repo_root: Path) -> Path:
+    """Root that case-yaml closure paths resolve against: the repo, or the
+    AIC_COLLECTOR_CASES_ROOT snapshot (same override case_generator.py and
+    capabilities.py honor) — recorded hashes must match the files actually
+    consumed at collection time."""
+    override = os.environ.get("AIC_COLLECTOR_CASES_ROOT")
+    return Path(override) if override else repo_root
 
 
 def collector_hash(module: str, repo_root: str | Path, closures: dict[str, list[str]]) -> str:
@@ -192,12 +204,17 @@ def collector_hash(module: str, repo_root: str | Path, closures: dict[str, list[
             "declare its hash closure in collector/hash_closures.yaml)"
         )
     root = Path(repo_root)
+    cases_root = _cases_root(root)
     module_file = module.replace(".", "/") + ".py"
     relpaths = {module_file, *SHARED_CORE, *_expand_closure_files(root, closures[module])}
 
     digest = hashlib.sha256()
     for relpath in sorted(relpaths):
-        content = (root / relpath).read_bytes()
+        # Case yamls ride the snapshot root when AIC_COLLECTOR_CASES_ROOT is
+        # set (they may differ from the repo after an upstream merge — that
+        # divergence is the point of the override).
+        base = cases_root if relpath.startswith("collector/cases/") else root
+        content = (base / relpath).read_bytes()
         digest.update(relpath.encode("utf-8"))
         digest.update(b"\0")
         digest.update(content)

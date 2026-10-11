@@ -34,8 +34,19 @@ def _xpu_available() -> bool:
 
 
 COLLECTOR_ROOT = Path(__file__).resolve().parent
-BASE_OP_CASES_DIR = COLLECTOR_ROOT / "cases" / "base_ops"
-MODEL_CASES_DIR = COLLECTOR_ROOT / "cases" / "models"
+# AIC_COLLECTOR_CASES_ROOT: root of a locally pinned test-case snapshot (layout
+# <root>/collector/cases/...). When set, ALL case yamls (base_ops/models) are
+# read from there instead of the repo, so upstream merges cannot change the
+# local case set. provenance.py resolves case closure paths against the same
+# root, keeping recorded hashes equal to the files actually consumed.
+_CASES_ROOT_OVERRIDE = os.environ.get("AIC_COLLECTOR_CASES_ROOT") or None
+if _CASES_ROOT_OVERRIDE:
+    _OVERRIDE_CASES = Path(_CASES_ROOT_OVERRIDE) / "collector" / "cases"
+    BASE_OP_CASES_DIR = _OVERRIDE_CASES / "base_ops"
+    MODEL_CASES_DIR = _OVERRIDE_CASES / "models"
+else:
+    BASE_OP_CASES_DIR = COLLECTOR_ROOT / "cases" / "base_ops"
+    MODEL_CASES_DIR = COLLECTOR_ROOT / "cases" / "models"
 
 # Backend names a model_case_values row may target via `frameworks:`. A typo
 # here would otherwise silently exclude the row from its intended backend.

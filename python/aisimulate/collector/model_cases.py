@@ -34,7 +34,14 @@ from typing import Any
 import yaml
 
 COLLECTOR_ROOT = Path(__file__).resolve().parent
-CASE_ROOT = COLLECTOR_ROOT / "cases"
+# AIC_COLLECTOR_CASES_ROOT: pinned local case snapshot (layout <root>/collector/cases);
+# same override as case_generator.py/capabilities.py — all case yamls read from the
+# snapshot when set, so upstream merges cannot change the local case set.
+_CASES_ROOT_OVERRIDE = os.environ.get("AIC_COLLECTOR_CASES_ROOT")
+if _CASES_ROOT_OVERRIDE:
+    CASE_ROOT = Path(_CASES_ROOT_OVERRIDE) / "collector" / "cases"
+else:
+    CASE_ROOT = COLLECTOR_ROOT / "cases"
 BASE_OP_CASES_DIR = CASE_ROOT / "base_ops"
 MODEL_CASES_DIR = CASE_ROOT / "models"
 _SOURCE_SYSTEMS_DIR = COLLECTOR_ROOT.parent / "src" / "aisimulate_core" / "systems"
