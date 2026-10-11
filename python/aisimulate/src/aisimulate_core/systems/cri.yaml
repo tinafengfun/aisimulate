@@ -9,7 +9,7 @@ gpu:
   mem_bw: 1500000000000 # 1.5 TB/s LPDDR5X
   mem_bw_empirical_scaling_factor: 0.5 # TODO(cri): re-measure on CRI
   mem_empirical_constant_latency: 0.000003 # TODO(cri): re-measure on CRI (3us)
-  mem_capacity: 171786108928 # 160GiB LPDDR5X
+  mem_capacity: 137438953472 # 128GiB LPDDR5X capacity cap (review decision 2026-10-10; device total measures 160GiB)
   float32_tc_flops: 20500000000000 # 20.5 TFLOPS (FP64: 10.2 TFLOPS)
   bfloat16_tc_flops: 655500000000000 # est: 1/2 FP8
   int8_tc_flops: 1311000000000000 # est: = FP8
