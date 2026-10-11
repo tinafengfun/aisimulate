@@ -450,9 +450,10 @@ def run_mla_module(
     def kernel_func():
         attn_module.forward(positions, hidden_states, None)
 
-    # Generation -> graph (matches decode serving); context -> eager (DSA
-    # prefill is heavy and its captured scratch would retain across tasks).
-    use_graph = xpu_graph_measure_enabled() and not is_context
+    # Graph for both phases, like every other op (NV full-graph parity). The
+    # captured scratch (~18 GiB for DSA prefill) is reclaimed per case by
+    # benchmark_with_power's graph teardown.
+    use_graph = xpu_graph_measure_enabled()
 
     # Optional overrides to reduce sustained load on heavy shapes (RAS stress).
     warming_up = int(os.environ.get("DSA_WARMUP", warming_up))
