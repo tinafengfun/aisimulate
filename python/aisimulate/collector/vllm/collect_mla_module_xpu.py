@@ -497,6 +497,7 @@ def run_mla_module(
                 "step": step,
                 "latency": f"{latency:.4f}",
                 "used_cuda_graph": results["used_cuda_graph"],
+                "timing_mode": "graph_full_pack1" if results["used_cuda_graph"] else "eager_repeat1",
             }
         ],
         framework="VLLM",

@@ -174,9 +174,11 @@ if GRAPH_POLICY not in ("full", "serving"):
 # 0 = decode max_model_len max(seq, 4096); N>0 = serving emulation (max_model_len N, decode metadata pinned to N,
 # e.g. 1048576 = vLLM's default for DeepSeek-V4).
 SERVING_MAX_MODEL_LEN = int(os.environ.get("AIC_VLLM_DSV4_MAX_MODEL_LEN", "0"))
-# Forwards per graph replay grow until one replay lasts >= PACK_TARGET_MS (amortizes replay launch cost;
-# CRI measured ~10% high and noisy with 1 ms replays, stable at 15 ms).
-PACK_TARGET_MS = float(os.environ.get("AIC_DSV4_PACK_TARGET_MS", "15"))
+# Forwards per graph replay grow until one replay lasts >= PACK_TARGET_MS. 0 (default)
+# = disabled: one forward per replay (repeat_n=1), the CUDA collector's measurement.
+# >0 = investigation mode: pack to >=PACK_TARGET_MS ms to amortize the ~20us XPU replay
+# launch cost (1 ms replays measured ~10% high and noisy; 15 ms stable).
+PACK_TARGET_MS = float(os.environ.get("AIC_DSV4_PACK_TARGET_MS", "0"))
 PACK_MAX = 64
 # >0: read an N MiB buffer before every forward to evict the last-level cache; its cost is subtracted.
 FLUSH_CACHE_MB = int(os.environ.get("AIC_DSV4_FLUSH_CACHE_MB", "0"))
