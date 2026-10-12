@@ -667,10 +667,17 @@ def _max_gqa_ratio():
 # (attn_compute_dtype, use_fp8_kv_cache) combos swept per system/phase. fp8 Q
 # compute on XPU requires an fp8 KV cache (the kernel couples them), so attn=fp8
 # only pairs with kv=fp8; attn=fp8/kv=bf16 is intentionally omitted. B60's kernel
-# is bf16-compute only. Generation is bf16 compute on every system.
+# is bf16-compute only, so it stays bf16 in both phases.
+#
+# CRI runs fp8 in generation too. The win is context-dependent, which is what
+# tells it apart from a mislabelled duplicate of the fp8-KV row: fp8/bf16 sits
+# at 0.94 for step<=127, falls through 0.79 at 255 and 0.67 at 511, and settles
+# near 0.6 beyond 4095 -- short contexts are launch-bound, long ones are KV
+# bandwidth-bound. Past ~8191 fp8 and fp8-KV converge to within 2% because a
+# single token's Q conversion is negligible against the KV stream.
 _ATTN_DTYPE_KV_COMBOS = {
     ("cri", "context"): [("bfloat16", False), ("bfloat16", True), ("fp8", True)],
-    ("cri", "generation"): [("bfloat16", False), ("bfloat16", True)],
+    ("cri", "generation"): [("bfloat16", False), ("bfloat16", True), ("fp8", True)],
 }
 _DEFAULT_ATTN_DTYPE_KV_COMBOS = [("bfloat16", False), ("bfloat16", True)]
 
