@@ -35,7 +35,12 @@ try:
 except ImportError:
     from vllm.utils.torch_utils import is_torch_equal_or_newer
 
-from vllm.v1.attention.backends.utils import set_kv_cache_layout
+try:
+    # vLLM <=0.27 exposed a process-global layout override here. 0.28 removed it
+    # in favour of CacheConfig.kv_cache_layout; see _force_kv_cache_layout.
+    from vllm.v1.attention.backends.utils import set_kv_cache_layout
+except ImportError:
+    set_kv_cache_layout = None  # type: ignore[assignment]
 from vllm.version import __version__ as vllm_version
 
 try:
@@ -93,6 +98,56 @@ def _get_backend_kv_cache_stride_order(backend_cls, ndim: int) -> tuple[int, ...
     if get_stride_order is None:
         return tuple(range(ndim))
     return tuple(get_stride_order())
+
+
+def _backend_required_kv_cache_layout(backend_cls) -> str | None:
+    """Physical KV cache layout the backend needs, across vLLM's two spellings.
+
+    vLLM <=0.27 exposed ``get_required_kv_cache_layout()`` returning a single
+    layout name. 0.28 replaced it with ``supported_kv_cache_layouts()``, which
+    returns ``KVCacheLayout`` members most-preferred-first or ``None`` when any
+    layout works; resolution then takes ``candidates[0]``
+    (vllm/v1/attention/backends/utils.py:204-218,318 @0.28.0.dev0). Taking the
+    first entry therefore reproduces the layout serving would pick.
+    """
+    supported = getattr(backend_cls, "supported_kv_cache_layouts", None)
+    if supported is not None:
+        layouts = supported()
+        if not layouts:
+            return None
+        first = layouts[0]
+        return getattr(first, "name", first)
+    legacy = getattr(backend_cls, "get_required_kv_cache_layout", None)
+    if legacy is not None:
+        return legacy()
+    return None
+
+
+def _force_kv_cache_layout(exit_stack, vllm_config, layout_name: str) -> None:
+    """Pin the physical KV cache layout for one collected case, then restore it.
+
+    0.28 dropped the ``set_kv_cache_layout`` process-global override. The layout
+    now lives on ``CacheConfig.kv_cache_layout``, and pre-setting it is the
+    sanctioned path for exactly this situation: "Tests and standalone tools may
+    pre-set a value, which resolution then honors as-is"
+    (vllm/config/cache.py:80-90 @0.28.0.dev0). The legacy ``NHD``/``HND`` names
+    remain valid as aliases of ``LBNHC``/``LBHNC``
+    (vllm/config/cache.py:21-24 @0.28.0.dev0).
+    """
+    cache_config = getattr(vllm_config, "cache_config", None)
+    if cache_config is not None and hasattr(cache_config, "kv_cache_layout"):
+        previous = cache_config.kv_cache_layout
+        cache_config.kv_cache_layout = layout_name
+        exit_stack.callback(setattr, cache_config, "kv_cache_layout", previous)
+        return
+    if set_kv_cache_layout is None:
+        raise RuntimeError(
+            f"vLLM {vllm_version} exposes neither CacheConfig.kv_cache_layout nor "
+            "set_kv_cache_layout, so the collector cannot pin the KV cache layout "
+            f"{layout_name!r} that this backend requires."
+        )
+    set_kv_cache_layout(layout_name)
+    exit_stack.callback(set_kv_cache_layout, None)
 
 
 # KV footprint above which the ~38us graph-replay launch is <~5% -> pack_n=1.
@@ -306,13 +361,11 @@ def run_attention_torch(
         # packed logical view into kernel inputs shaped [num_blocks,
         # block_size, num_kv_heads, head_size]. Keep vLLM's backend-selected
         # physical stride order so those kernel views match serving.
-        get_required_layout = getattr(backend_cls, "get_required_kv_cache_layout", None)
-        if get_required_layout is not None:
-            set_kv_cache_layout(get_required_layout())
-            exit_stack.callback(set_kv_cache_layout, None)
-        elif backend_name_str == "FLASHINFER":
-            set_kv_cache_layout("HND")
-            exit_stack.callback(set_kv_cache_layout, None)
+        required_layout = _backend_required_kv_cache_layout(backend_cls)
+        if required_layout is None and backend_name_str == "FLASHINFER":
+            required_layout = "HND"
+        if required_layout is not None:
+            _force_kv_cache_layout(exit_stack, vllm_config, required_layout)
         stride_order = _get_backend_kv_cache_stride_order(backend_cls, 4)
         kv_cache = _pack_v1_fa_kv_cache(kv_cache, stride_order)
 
