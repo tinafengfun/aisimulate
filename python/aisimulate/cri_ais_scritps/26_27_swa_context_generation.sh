@@ -16,9 +16,9 @@ unset DEEPKLOX_SPARSE_PREFILL_DISABLE_FUSED AIC_VLLM_DSV4_PREFILL_CHUNK_TOKENS A
 
 export AIC_DSV4_GRAPH_POLICY=full AIC_DSV4_PACK_TARGET_MS=15 AIC_DSV4_DUMMY_DATA=random
 export AIC_VLLM_DSV4_MAX_MODEL_LEN=${MML:-0} AIC_DSV4_FLUSH_CACHE_MB=${FLUSH:-0}
-export PYTHONPATH=/workspace/intel_gpu_cri.ai.customer.poc/CRI/Alibaba/ops_benchmark/ais/intel-aisimulate/python/aisimulate
+export PYTHONPATH="${AIS_ROOT}"
 
-C=$PYTHONPATH/collector/collect.py
+C="${COLLECT_PY}"
 
 OPS=${OPS:-"dsv4_swa_generation_module dsv4_swa_context_module"}
 ts=$(TZ='Asia/Shanghai' date +%F-%H-%M-%S)
@@ -27,10 +27,10 @@ mkdir -p "$OUT" && cd "$OUT"
 MODEL="deepseek-ai/DeepSeek-V4-Flash"
 
 for op in $OPS; do
-  python $C --backend vllm --gpu cri --model-path $MODEL --keep-csv --resume --resume-retry-failed --ops $op
+  "${PYTHON}" "$C" --backend vllm --gpu cri --model-path $MODEL --keep-csv --resume --resume-retry-failed --ops $op
 done
 
 MODEL="deepseek-ai/DeepSeek-V4.1-Flash"
 for op in $OPS; do
-  python $C --backend vllm --gpu cri --model-path $MODEL --keep-csv --resume --resume-retry-failed --ops $op
+  "${PYTHON}" "$C" --backend vllm --gpu cri --model-path $MODEL --keep-csv --resume --resume-retry-failed --ops $op
 done
