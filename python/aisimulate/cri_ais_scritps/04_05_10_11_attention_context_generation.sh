@@ -6,9 +6,9 @@
 #
 # Usage (inside the GPU container):
 #   bash 04_05_10_11_attention_context_generation.sh                      # full grids
-#   bash 04_05_10_11_attention_context_generation.sh smoke                # smoke (sampled cases)
-#   bash 04_05_10_11_attention_context_generation.sh smoke dsv4_swa_generation_module
-#   bash 04_05_10_11_attention_context_generation.sh -d 1 smoke           # pin to a GPU
+#   bash 04_05_10_11_attention_context_generation.sh -s                   # smoke (sampled cases)
+#   bash 04_05_10_11_attention_context_generation.sh -s dsv4_swa_generation_module
+#   bash 04_05_10_11_attention_context_generation.sh -d 1 -s              # pin to a GPU
 #   OUT=<existing dir> bash 04_05_10_11_attention_context_generation.sh   # resume
 #
 # Results land in ./<outdir> under the current directory (perf.txt per op + logs).
@@ -56,9 +56,9 @@ export PYTHONPATH="${AIS_ROOT}${PYTHONPATH:+:$PYTHONPATH}"
 C="${COLLECT_PY}"
 
 MODE="full"
-if [[ "${USER_ARGS[0]:-}" = "smoke" ]]; then
+if [[ "${AIS_SMOKE}" = 1 || "${USER_ARGS[0]:-}" = "smoke" ]]; then
     MODE="smoke"
-    USER_ARGS=("${USER_ARGS[@]:1}")
+    [[ "${USER_ARGS[0]:-}" = "smoke" ]] && USER_ARGS=("${USER_ARGS[@]:1}")
 fi
 
 OPS_DEFAULT="dsv4_csa_context_module dsv4_csa_generation_module \
@@ -84,6 +84,6 @@ fi
 
 for op in ${OPS}; do
     echo "===== RUN ${op} (${MODE}) ====="
-    "${PYTHON}" "${C}" ${FLAGS} --ops "${op}" 2>&1 | tee -a "run_${op}_${ts}.log"
+    ais_run "${PYTHON}" "${C}" ${FLAGS} --ops "${op}"
 done
 echo "ALL_OPS_DONE mode=${MODE} run_dir=$(pwd)"

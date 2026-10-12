@@ -6,6 +6,6 @@ AIS_GPU_DEFAULT=0
 AIS_GPU_HELP="GPU id this collector runs on"
 ais_parse_args "$@"
 
-COLLECTOR_ATTN_YAML_ONLY=1 VLLM_XPU_ENABLE_XPU_GRAPH=1 \
+ais_run COLLECTOR_ATTN_YAML_ONLY=1 VLLM_XPU_ENABLE_XPU_GRAPH=1 \
     "${PYTHON}" "${COLLECT_PY}" \
-    --backend vllm --ops attention_generation --gpu cri --keep-csv "${EXTRA_ARGS[@]}"
+    --backend vllm --ops attention_generation --gpu cri --keep-csv "${AIS_SMOKE_ARGS[@]}" "${EXTRA_ARGS[@]}"

@@ -20,6 +20,9 @@ export PYTHONPATH="${AIS_ROOT}"
 
 C="${COLLECT_PY}"
 
+FLAGS="--keep-csv --resume --resume-retry-failed"
+[[ "${AIS_SMOKE}" = 1 ]] && FLAGS="--keep-csv --smoke"
+
 OPS=${OPS:-"dsv4_swa_generation_module dsv4_swa_context_module"}
 ts=$(TZ='Asia/Shanghai' date +%F-%H-%M-%S)
 OUT=${OUT:-dsv4_swa_context_generation_xpu_$ts}
@@ -27,10 +30,10 @@ mkdir -p "$OUT" && cd "$OUT"
 MODEL="deepseek-ai/DeepSeek-V4-Flash"
 
 for op in $OPS; do
-  "${PYTHON}" "$C" --backend vllm --gpu cri --model-path $MODEL --keep-csv --resume --resume-retry-failed --ops $op
+  ais_run "${PYTHON}" "$C" --backend vllm --gpu cri --model-path $MODEL $FLAGS --ops $op
 done
 
 MODEL="deepseek-ai/DeepSeek-V4.1-Flash"
 for op in $OPS; do
-  "${PYTHON}" "$C" --backend vllm --gpu cri --model-path $MODEL --keep-csv --resume --resume-retry-failed --ops $op
+  ais_run "${PYTHON}" "$C" --backend vllm --gpu cri --model-path $MODEL $FLAGS --ops $op
 done
