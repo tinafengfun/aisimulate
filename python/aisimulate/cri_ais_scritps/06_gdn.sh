@@ -2,7 +2,7 @@
 set -euo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 
-AIS_GPU_DEFAULT=3
+AIS_GPU_DEFAULT=0
 AIS_GPU_HELP="GPU id this collector runs on"
 ais_parse_args "$@"
 
