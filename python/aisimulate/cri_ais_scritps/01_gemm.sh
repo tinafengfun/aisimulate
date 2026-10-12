@@ -8,4 +8,4 @@ ais_parse_args "$@"
 
 ZE_AFFINITY_MASK="${ZE_AFFINITY_MASK}" VLLM_XPU_ENABLE_XPU_GRAPH=1 \
     "${PYTHON}" "${COLLECT_PY}" \
-    --backend vllm --ops gemm --gpu cri "${EXTRA_ARGS[@]}"
+    --backend vllm --ops gemm --gpu cri --keep-csv "${EXTRA_ARGS[@]}"
