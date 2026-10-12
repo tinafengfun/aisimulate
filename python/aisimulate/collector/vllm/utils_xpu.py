@@ -68,6 +68,32 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 _COMMON_ATTN_METADATA_PARAMS = set(inspect.signature(CommonAttentionMetadata).parameters)
 
 
+def _attn_seq_lens_cpu(common_attn_metadata):
+    # seq_lens_cpu/_seq_lens_cpu were removed from CommonAttentionMetadata at
+    # vllm 0.28.0.dev0; create_common_attn_metadata stores the same values in
+    # whichever field the version still accepts.
+    for attr in ("_seq_lens_cpu", "seq_lens_cpu_upper_bound", "seq_lens_cpu"):
+        v = getattr(common_attn_metadata, attr, None)
+        if v is not None:
+            return v
+    raise AttributeError("no seq_lens_cpu equivalent on CommonAttentionMetadata")
+
+
+def _attn_computed_tokens_cpu(common_attn_metadata):
+    # num_computed_tokens_cpu was removed from CommonAttentionMetadata at
+    # vllm 0.28.0.dev0; the version's own accessor is compute_num_computed_tokens().
+    v = getattr(common_attn_metadata, "num_computed_tokens_cpu", None)
+    if v is not None:
+        return v
+    v = getattr(common_attn_metadata, "_num_computed_tokens_cpu", None)
+    if v is not None:
+        return v
+    if hasattr(common_attn_metadata, "compute_num_computed_tokens"):
+        return common_attn_metadata.compute_num_computed_tokens().cpu()
+    q = common_attn_metadata.query_start_loc_cpu
+    return common_attn_metadata.seq_lens.cpu() - (q[1:] - q[:-1])
+
+
 class MockAttentionLayer:
     """A mock attention layer for testing."""
 
@@ -163,6 +189,9 @@ def create_common_attn_metadata(
         metadata_kwargs["_num_computed_tokens_cpu"] = num_computed_tokens_cpu
     elif "num_computed_tokens_cpu" in _COMMON_ATTN_METADATA_PARAMS:
         metadata_kwargs["num_computed_tokens_cpu"] = num_computed_tokens_cpu
+    elif "_num_computed_tokens_cache" in _COMMON_ATTN_METADATA_PARAMS:
+        # vllm 0.28.0.dev0: computed tokens moved into a device-side cache field
+        metadata_kwargs["_num_computed_tokens_cache"] = num_computed_tokens_cpu.to(device)
     if "seq_start_loc_cpu" in _COMMON_ATTN_METADATA_PARAMS:
         metadata_kwargs["seq_start_loc_cpu"] = None
     if "seq_start_loc" in _COMMON_ATTN_METADATA_PARAMS:
@@ -413,9 +442,9 @@ def create_and_prepopulate_kv_cache_mla(
         MLA KV cache tensor
     """
     batch_size = len(kv_c_contexts)
-    seq_lens = common_attn_metadata.seq_lens_cpu
+    seq_lens = _attn_seq_lens_cpu(common_attn_metadata)
     query_lens = common_attn_metadata.query_start_loc_cpu[1:] - common_attn_metadata.query_start_loc_cpu[:-1]
-    context_lens = common_attn_metadata.num_computed_tokens_cpu
+    context_lens = _attn_computed_tokens_cpu(common_attn_metadata)
     block_table = common_attn_metadata.block_table_tensor
     slot_mapping = common_attn_metadata.slot_mapping
 
@@ -544,9 +573,9 @@ def create_and_prepopulate_kv_cache(
         Tuple of (kv_cache, updated_block_table)
     """
     batch_size = len(k_contexts)
-    seq_lens = common_attn_metadata.seq_lens_cpu
+    seq_lens = _attn_seq_lens_cpu(common_attn_metadata)
     query_lens = common_attn_metadata.query_start_loc_cpu[1:] - common_attn_metadata.query_start_loc_cpu[:-1]
-    context_lens = common_attn_metadata.num_computed_tokens_cpu
+    context_lens = _attn_computed_tokens_cpu(common_attn_metadata)
     block_table = common_attn_metadata.block_table_tensor
     slot_mapping = common_attn_metadata.slot_mapping
 
