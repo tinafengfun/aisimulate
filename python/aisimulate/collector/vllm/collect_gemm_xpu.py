@@ -169,10 +169,27 @@ def run_gemm(exit_stack, gemm_type, m, n, k, *, perf_filename, device="xpu:0"):
         )
     elif gemm_type in ("mxfp4", "mxfp8"):
         # MXFP4/MXFP8 dense-linear only exists on vLLM's "online" path.
-        from vllm.config.quantization import resolve_quantization_config
+        #
+        # mxfp4/mxfp8 are *also* checkpoint quantization methods, so they sit in
+        # _DEFERRED_ONLINE_SHORTHANDS and resolve_quantization_config() returns
+        # None for them on purpose (vllm/config/quantization.py:228-230, 262-265;
+        # see also the note at model_loader/weight_utils.py:251-252). Serving
+        # resolves them later, once it knows no checkpoint quant metadata exists,
+        # by taking the shorthand's base args:
+        #
+        #     if model_config.quantization in _ONLINE_SHORTHANDS:
+        #         args = online_args or _ONLINE_SHORTHANDS[model_config.quantization]
+        #         return OnlineQuantizationConfig(args=args)
+        #
+        # -- vllm/model_executor/layers/quantization/__init__.py consumers at
+        #    model_loader/weight_utils.py:386-389 and :398-401 (vllm 0.28.0.dev0).
+        #
+        # This benchmark has no checkpoint at all, which is exactly that branch,
+        # so mirror it instead of passing the deferred None into the config.
+        from vllm.config.quantization import _ONLINE_SHORTHANDS
         from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
 
-        qc = OnlineQuantizationConfig(resolve_quantization_config(gemm_type, None))
+        qc = OnlineQuantizationConfig(args=_ONLINE_SHORTHANDS[gemm_type])
     else:
         qc = None
 
