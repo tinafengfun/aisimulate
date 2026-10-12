@@ -1601,12 +1601,20 @@ def test_vllm_024_schedules_consumed_dsv4_modules_only():
         "dsv4_csa_generation_module",
         "dsv4_hca_context_module",
         "dsv4_hca_generation_module",
+        "dsv4_swa_context_module",
+        "dsv4_swa_generation_module",
         "gemm",
         "moe",
     ]
     assert consumed_dsv4_ops <= plan.selected_ops
     assert registry_only_ops.isdisjoint(plan.selected_ops)
     assert consumed_dsv4_ops | registry_only_ops <= {entry.op for entry in REGISTRY}
+
+
+def test_vllm_v41_flash_schedules_only_the_dsv4_swa_modules():
+    plan = build_collection_case_plan(backend="vllm", model_path="deepseek-ai/DeepSeek-V4.1-Flash")
+
+    assert plan.ops == ["dsv4_swa_context_module", "dsv4_swa_generation_module"]
 
 
 def test_model_architecture_can_select_case_file():

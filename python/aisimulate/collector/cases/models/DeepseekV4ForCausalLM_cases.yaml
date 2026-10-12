@@ -450,6 +450,12 @@ framework_specific_op_cases:
       cases: all
     dsv4_hca_generation_module:
       cases: all
+    # SWA (sliding-window attention) front-layer module — V4-Flash / V4.1-Flash
+    # only (V4-Pro has no SWA layers). compress_ratio=0, window=128.
+    dsv4_swa_context_module:
+      cases: all
+    dsv4_swa_generation_module:
+      cases: all
   trtllm:
     # TRT-LLM 1.3.0rc20 ships the mHC module + torch.ops.trtllm.mhc_* kernels
     # (tensorrt_llm/_torch/modules/mhc/) but no DeepseekV4 model class yet, so

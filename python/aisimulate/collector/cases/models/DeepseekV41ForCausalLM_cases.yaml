@@ -26,3 +26,9 @@ framework_specific_op_cases:
   sglang:
     dsv41_module:
       cases: all
+  vllm:
+    # Only V4.1's SWA layers (compress_ratio 0) match a DSV4 module; its ratio-1/2 layers have none.
+    dsv4_swa_context_module:
+      cases: all
+    dsv4_swa_generation_module:
+      cases: all

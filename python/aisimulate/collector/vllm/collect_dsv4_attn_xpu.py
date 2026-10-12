@@ -40,16 +40,17 @@ gemm_type: ``mxfp8`` = online MXFP8 linears, the 1x32/E8M0 granularity the XPU
 ``wo_a`` to oneDNN's reference bmm (not a serving path), so the XPU grids
 collect mxfp8 only (declared NV↔XPU fp8_block coverage gap).
 
-Timing follows the V1 model runner's own dispatch (``VLLM_USE_V2_MODEL_RUNNER=0``,
-``VLLM_XPU_ENABLE_XPU_GRAPH=1``): batches within
-``AIC_VLLM_DSV4_MAX_CUDAGRAPH_CAPTURE_SIZE`` tokens (default 256 = vLLM's
-``2 * --max-num-seqs`` for the CRI recipe's 128) replay a graph, larger ones
-run eagerly. Decode replays a FULL graph with capture-pinned metadata
-(``max_seq_len = max_model_len``, pinning the C128A top-k width), packed
-``_decode_pack_n`` forwards per replay; prefill replays a breakable PIECEWISE
-graph once per forward (serving pays one piecewise replay per layer, so no
-further packing). ``AIC_DSV4_PREFILL_TIMING`` retains the eager investigation
-modes.
+Timing (default, identical to the CUDA collector): every shape, context and
+decode at any batch size, is captured as one FULL XPU graph; forwards are
+packed per replay until a replay lasts ``AIC_DSV4_PACK_TARGET_MS`` (15 ms), and
+decode metadata uses the real sequence lengths with ``max_model_len =
+max(seq, 4096)``. ``AIC_VLLM_DSV4_MAX_MODEL_LEN=N`` emulates serving's
+capture-pinned decode widths (``max_seq_len = N``), ``AIC_DSV4_FLUSH_CACHE_MB``
+times every forward from a cold last-level cache, ``AIC_DSV4_DUMMY_DATA=const``
+restores the constant dummy data, and ``AIC_DSV4_GRAPH_POLICY=serving`` restores
+the V1 runner dispatch (PIECEWISE within
+``AIC_VLLM_DSV4_MAX_CUDAGRAPH_CAPTURE_SIZE`` tokens, eager above;
+``AIC_DSV4_PREFILL_TIMING`` picks the context eager mode).
 
 The attention path uses dummy weights; the collector does not override vLLM's
 backend selection at import time.
@@ -84,7 +85,6 @@ import os as _os_pre
 _os_pre.environ.setdefault("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
 
 import torch
-import vllm.envs as vllm_envs
 import vllm_xpu_kernels._xpu_C  # noqa: F401
 from collector.case_generator import (
     _DSV4_DEFAULT_MODELS,
@@ -157,15 +157,32 @@ COMPRESSED_BLOCK_SIZE = 256  # cache_config.block_size of the compressed (C4A/C1
 # requests), as on CUDA; >0 splits each call into <=N independent rows
 # (output unchanged; tagged +prefill_chunkN in kernel_source).
 PREFILL_CHUNK_TOKENS = int(os.environ.get("AIC_VLLM_DSV4_PREFILL_CHUNK_TOKENS", "0"))
-# TODO: default to "0" (collect them) once deepklox fixes the fused-prefill
-# int32 overflow (repro_sparse_prefill_int32_overflow.py).
-SKIP_PREFILL_OVERFLOW = os.environ.get("AIC_VLLM_DSV4_SKIP_PREFILL_OVERFLOW", "1") != "0"
+# 1 = skip shapes that overflow the fused-prefill int32 offsets; only needed on deepklox builds
+# without the int64-offset fix (c4235656, repro_sparse_prefill_int32_overflow.py).
+SKIP_PREFILL_OVERFLOW = os.environ.get("AIC_VLLM_DSV4_SKIP_PREFILL_OVERFLOW", "0") != "0"
 # vLLM max_cudagraph_capture_size: min(2 * --max-num-seqs, 512,
 # --max-num-batched-tokens) — the CRI recipe's 128 max-num-seqs gives 256.
+# Only used by AIC_DSV4_GRAPH_POLICY=serving.
 MAX_CUDAGRAPH_CAPTURE_SIZE = int(os.environ.get("AIC_VLLM_DSV4_MAX_CUDAGRAPH_CAPTURE_SIZE", "256"))
-# Serving --max-model-len for decode; 0 = the model's max_position_embeddings
-# (vLLM's default).
+# full (default) = every shape under one FULL XPU graph, as the CUDA collector;
+# serving = the vLLM-XPU V1 runner dispatch (piecewise <= capture size, eager above).
+GRAPH_POLICY = os.environ.get("AIC_DSV4_GRAPH_POLICY", "full")
+if GRAPH_POLICY not in ("full", "serving"):
+    raise ValueError(f"AIC_DSV4_GRAPH_POLICY must be 'full' or 'serving', got {GRAPH_POLICY!r}")
+
+# Cross-platform measurement contract, kept identical in collect_dsv4_attn.py (CUDA):
+# 0 = decode max_model_len max(seq, 4096); N>0 = serving emulation (max_model_len N, decode metadata pinned to N,
+# e.g. 1048576 = vLLM's default for DeepSeek-V4).
 SERVING_MAX_MODEL_LEN = int(os.environ.get("AIC_VLLM_DSV4_MAX_MODEL_LEN", "0"))
+# Forwards per graph replay grow until one replay lasts >= PACK_TARGET_MS (amortizes replay launch cost;
+# CRI measured ~10% high and noisy with 1 ms replays, stable at 15 ms).
+PACK_TARGET_MS = float(os.environ.get("AIC_DSV4_PACK_TARGET_MS", "15"))
+PACK_MAX = 64
+# >0: read an N MiB buffer before every forward to evict the last-level cache; its cost is subtracted.
+FLUSH_CACHE_MB = int(os.environ.get("AIC_DSV4_FLUSH_CACHE_MB", "0"))
+DUMMY_DATA = os.environ.get("AIC_DSV4_DUMMY_DATA", "random")
+if DUMMY_DATA not in ("random", "const"):
+    raise ValueError(f"AIC_DSV4_DUMMY_DATA must be 'random' or 'const', got {DUMMY_DATA!r}")
 
 # Context-forward peak fit on CRI: hidden in + q/output (2 KiB per local head)
 # + this per token, + static.
@@ -174,6 +191,9 @@ CONTEXT_STATIC_BYTES = 8 * 2**30
 # VLLM_XPU_MXFP8_USE_SYCLTLA=1: deepklox's GEMM takes an fp32 [M, N] workspace,
 # ~2 KiB per local head and token (2.5 measured, with allocator fragmentation).
 SYCLTLA_KIB_PER_LOCAL_HEAD = 2.5
+# Not a registered vllm env var (vllm.envs.__getattr__ raises AttributeError for
+# it), so read it straight from the environment rather than via vllm_envs.
+_USE_SYCLTLA = os.environ.get("VLLM_XPU_MXFP8_USE_SYCLTLA", "1").lower() in ("1", "true", "yes")
 # An XPU OOM surfaces as UR_RESULT_ERROR_DEVICE_LOST (not OutOfMemoryError), so
 # stay below it.
 MAX_MEM_FRACTION = 0.9
@@ -335,11 +355,13 @@ def _context_exceeds_memory(model_path: str, attn_kind: str, batch_size: int, qu
     """Generation-time memory-feasibility filter (the one sanctioned in-collector
     filter: size vs capacity, counted + logged — see _get_test_cases)."""
     hidden_bytes = 2 * int(_read_model_config(model_path)["hidden_size"])
-    kib_per_head = 2 + (SYCLTLA_KIB_PER_LOCAL_HEAD if vllm_envs.VLLM_XPU_MXFP8_USE_SYCLTLA else 0)
+    kib_per_head = 2 + (SYCLTLA_KIB_PER_LOCAL_HEAD if _USE_SYCLTLA else 0)
     per_token = (
         hidden_bytes
         + (kib_per_head * _local_num_heads(model_path, tp_size) + CONTEXT_EXTRA_KIB_PER_TOKEN[attn_kind]) * 1024
     )
+    # No full-graph multiplier: torch.xpu.graph empties the cache before capture; measured
+    # full-graph device peaks are 0.46-0.66x of this estimate (11 shapes, tp1-8, up to 1M tokens).
     peak = CONTEXT_STATIC_BYTES + batch_size * query_len * per_token
     return peak > MAX_MEM_FRACTION * get_device_module().get_device_properties(0).total_memory
 
@@ -381,11 +403,20 @@ def _tp_simulation(tp_size: int):
 
 
 def _init_dummy_module_tensors(module: torch.nn.Module) -> None:
+    # Constant/zero data lowers switching power (measured: Pro5000 prefill 7-11% faster), so matrices are
+    # seeded-random by default; scales and 1D tensors keep the legacy values.
+    randomize = DUMMY_DATA == "random"
+    generators = {}
     with torch.no_grad():
         for name, tensor in list(module.named_parameters()) + list(module.named_buffers()):
             if tensor.is_meta:
                 continue
-            if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.uint8):
+            matrix = randomize and tensor.dim() >= 2 and "scale" not in name
+            if matrix and tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.bfloat16, torch.float16, torch.float32):
+                gen = generators.setdefault(tensor.device, torch.Generator(device=tensor.device).manual_seed(0))
+                std = 0.05 if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) else 0.02
+                tensor.copy_((torch.randn(tensor.shape, generator=gen, device=tensor.device) * std).to(tensor.dtype))
+            elif tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.uint8):
                 tensor.zero_()
             elif tensor.dtype == torch.float8_e8m0fnu:
                 tensor.view(torch.uint8).fill_(127)  # e8m0 exponent 127 == 1.0
@@ -393,6 +424,60 @@ def _init_dummy_module_tensors(module: torch.nn.Module) -> None:
                 tensor.fill_(1.0)
             else:
                 tensor.fill_(0.01)
+
+
+def _dummy_hidden_states(num_tokens: int, hidden_size: int, device: str) -> torch.Tensor:
+    if DUMMY_DATA == "const":
+        return torch.full((num_tokens, hidden_size), 0.01, dtype=torch.bfloat16, device=device)
+    gen = torch.Generator(device=device).manual_seed(1)
+    return torch.randn((num_tokens, hidden_size), generator=gen, dtype=torch.bfloat16, device=device)
+
+
+def _bench_forward_graph(kernel_func, *, device: str, warming_up: int, test_ite: int) -> tuple[float, int, dict]:
+    """Per-forward latency of ``kernel_func`` replayed from one full device graph.
+
+    Forwards are packed into the graph until a replay lasts >= PACK_TARGET_MS, so the
+    platform's per-replay launch cost (CUDA ~3 us, XPU ~20 us) does not leak into the
+    per-layer number. With FLUSH_CACHE_MB, each forward starts from a cold last-level cache.
+    """
+    flush = None
+    if FLUSH_CACHE_MB > 0:
+        flush_buf = torch.ones(FLUSH_CACHE_MB << 19, dtype=torch.bfloat16, device=device)
+
+        def flush():
+            flush_buf.amax()
+
+    def step():
+        if flush is not None:
+            flush()
+        kernel_func()
+
+    def measure(fn, pack: int) -> dict:
+        with benchmark_with_power(
+            device=torch.device(device),
+            kernel_func=fn,
+            num_warmups=warming_up,
+            num_runs=test_ite,
+            repeat_n=pack,
+            use_cuda_graph=True,
+            allow_graph_fail=False,
+        ) as result:
+            pass
+        return result
+
+    pack = 1
+    result = measure(step, pack)
+    if float(result["latency_ms"]) < PACK_TARGET_MS:
+        pack = min(PACK_MAX, math.ceil(PACK_TARGET_MS / max(float(result["latency_ms"]), 1e-3)))
+        result = measure(step, pack)
+    latency = float(result["latency_ms"])
+    if flush is not None:
+        latency -= float(measure(flush, pack)["latency_ms"])
+    return latency, pack, result
+
+
+def _timing_mode(pack: int) -> str:
+    return f"graph_full_pack{pack}" + (f"_flush{FLUSH_CACHE_MB}mb" if FLUSH_CACHE_MB > 0 else "")
 
 
 def _process_quantized_weights(module: torch.nn.Module, vllm_config) -> None:
@@ -774,10 +859,23 @@ def _context_timing_mode() -> str:
 
 
 def _graph_mode(batch_size: int, query_len: int) -> str:
-    """Graph mode the vLLM-XPU V1 runner dispatches this batch to: full, piecewise or eager."""
-    if not xpu_graph_measure_enabled() or batch_size * query_len > MAX_CUDAGRAPH_CAPTURE_SIZE:
+    """full | piecewise | eager. Policy full: one FULL graph for every shape (CUDA-collector parity);
+    policy serving: the vLLM-XPU V1 runner's own dispatch."""
+    if not xpu_graph_measure_enabled():
+        return "eager"
+    if GRAPH_POLICY == "full":
+        return "full"
+    if batch_size * query_len > MAX_CUDAGRAPH_CAPTURE_SIZE:
         return "eager"
     return "full" if query_len == 1 else "piecewise"  # uniform decode -> FULL
+
+
+def _repeated(fn, n: int):
+    def run():
+        for _ in range(n):
+            fn()
+
+    return run
 
 
 def _capture_breakable_graph(kernel_func) -> BreakableCUDAGraphCapture:
@@ -817,10 +915,10 @@ def _bench_attention_shape(
     # current decode token, so construct with +1 (SGLang collector convention).
     metadata_seq_len = prefix_len + seq_len if is_context else seq_len + 1
     query_len = seq_len if is_context else 1
-    # Single-token batches (decode, isl=1 prefill) take the decode path, whose
-    # capture-time metadata widths follow max_model_len (serving parity).
-    serving_max_model_len = SERVING_MAX_MODEL_LEN or int(_read_model_config(model_path)["max_position_embeddings"])
-    max_model_len = max(metadata_seq_len, serving_max_model_len if query_len == 1 else 4096)
+    # Single-token batches (decode, isl=1 prefill) take the decode path. Default widths follow the CUDA
+    # collector (max(seq, 4096)); AIC_VLLM_DSV4_MAX_MODEL_LEN>0 emulates serving's capture-time widths.
+    serving_emulation = SERVING_MAX_MODEL_LEN > 0 and query_len == 1
+    max_model_len = max(metadata_seq_len, SERVING_MAX_MODEL_LEN if serving_emulation else 4096)
     # Context timing via AIC_DSV4_PREFILL_TIMING (default "graph" = production
     # verdict, see _context_timing_mode): then "graph" means the vLLM-XPU V1
     # runner's own dispatch (_graph_mode) — piecewise capture for context, full
@@ -856,7 +954,7 @@ def _bench_attention_shape(
             device=device,
             query_len=query_len,
         )
-        if graph_mode == "full":
+        if graph_mode == "full" and serving_emulation:
             # Capture-time metadata is built against max_model_len (serving's
             # for_cudagraph_capture=True behavior), pinning the C128A top-k
             # width; the KV cache itself covers the real context (see
@@ -897,12 +995,7 @@ def _bench_attention_shape(
                 f"config num_attention_heads // tp_size = {expected_local} (tp_size={tp_size})"
             )
         num_tokens = batch_size * seq_len if is_context else batch_size
-        hidden_states = torch.full(
-            (num_tokens, hf_config.hidden_size),
-            0.01,
-            dtype=torch.bfloat16,
-            device=device,
-        )
+        hidden_states = _dummy_hidden_states(num_tokens, hf_config.hidden_size, device)
         positions = common.positions
 
         capture = None
@@ -917,75 +1010,40 @@ def _bench_attention_shape(
             ):
                 attn_module(positions, hidden_states, None)
 
-            # Context (switch at "graph", production verdict — see
-            # _context_timing_mode): PIECEWISE (serving dispatch) with pack_n=1
-            # (serving pays one piecewise replay per layer per step, so packing
-            # would understate it) and repeat_n=1 (kernel-bound, CUDA parity).
-            # Generation is NOT switch-controlled: always the runner's full-graph
-            # decode path with pack_n replays per capture; capture failure fails
-            # the case (allow_graph_fail=False).
-            timing_label = None
+            # Policy full (default): every shape is one FULL graph timed by _bench_forward_graph,
+            # the same harness as the CUDA collector. Policy serving keeps the runner dispatch:
+            # PIECEWISE for context within the capture size, eager above it
+            # (AIC_DSV4_PREFILL_TIMING picks the context eager mode).
+            pack_n = 1
             kv_bytes_per_token = int(cache_spec.page_size_bytes) // int(cache_spec.block_size)
-            if is_context:
+            if graph_mode == "full":
+                latency, pack_n, result = _bench_forward_graph(
+                    kernel_func, device=device, warming_up=warming_up, test_ite=test_ite
+                )
+                timing_label = _timing_mode(pack_n)
+            else:
                 if graph_mode == "piecewise":
                     capture = _capture_breakable_graph(kernel_func)
-                    pack_n = 1
-                    repeat_n = 1
-                    timing_label = "graph_piecewise"
-                    run = capture.replay
-                elif prefill_timing_mode == "eager_rep":
-                    pack_n = 1
-                    repeat_n = 10
-                    timing_label = "eager_repeat10"
-                    run = kernel_func
-                elif prefill_timing_mode == "eager_pack":
+                    run, repeat_n, timing_label = capture.replay, 1, "graph_piecewise"
+                elif is_context and prefill_timing_mode == "eager_pack":
                     pack_n = _decode_pack_n(state_bytes=batch_size * seq_len * kv_bytes_per_token)
-                    repeat_n = 1
-                    timing_label = f"eager_pack{pack_n}"
-
-                    def run():
-                        for _ in range(pack_n):
-                            kernel_func()
+                    run, repeat_n, timing_label = _repeated(kernel_func, pack_n), 1, f"eager_pack{pack_n}"
                 else:
-                    # Graph requested but the runner dispatch says eager (above
-                    # MAX_CUDAGRAPH_CAPTURE_SIZE, or no graph support) — degrade
-                    # and record what actually ran (used_cuda_graph/timing_mode).
-                    pack_n = 1
-                    repeat_n = 10
-                    timing_label = "eager_repeat10"
-                    run = kernel_func
-            elif graph_mode == "full":
-                # Per-call KV read: index_topk tokens from the main cache plus
-                # the sliding window from the SWA cache, both in the same
-                # per-token bytes (framework spec at runtime, never hardcoded).
-                state_bytes = (
-                    batch_size * (int(hf_config.index_topk) + int(hf_config.sliding_window)) * kv_bytes_per_token
-                )
-                pack_n = _decode_pack_n(state_bytes=state_bytes)
-                repeat_n = 1
-
-                def run():
-                    for _ in range(pack_n):
-                        kernel_func()
-            else:
-                pack_n = 1
-                repeat_n = 10
-                run = kernel_func
-
-            with benchmark_with_power(
-                device=torch.device(device),
-                kernel_func=run,
-                num_warmups=warming_up,
-                num_runs=test_ite,
-                repeat_n=repeat_n,
-                use_cuda_graph=capture is None and graph_mode == "full",
-                allow_graph_fail=False,
-            ) as result:
-                pass
+                    run, repeat_n, timing_label = kernel_func, 10, "eager_repeat10"
+                with benchmark_with_power(
+                    device=torch.device(device),
+                    kernel_func=run,
+                    num_warmups=warming_up,
+                    num_runs=test_ite,
+                    repeat_n=repeat_n,
+                    use_cuda_graph=False,
+                    allow_graph_fail=False,
+                ) as result:
+                    pass
+                latency = float(result["latency_ms"]) / pack_n
 
     used_graph = capture is not None or bool(result.get("used_cuda_graph", False))
-    timing_mode = timing_label or ("graph_pack" if used_graph else "eager_repeat10")
-    latency = float(result["latency_ms"]) / pack_n
+    timing_mode = timing_label
     log_perf(
         item_list=[
             {
@@ -1460,8 +1518,8 @@ def _get_test_cases(attn_kind: str, mode: str) -> list[list]:
         query_len = seq_len if mode == "context" else 1
         if SKIP_PREFILL_OVERFLOW and _fused_prefill_overflows(model_path, batch_size, query_len, tp_size):
             reason = (
-                "fused sparse_mla_prefill int32 overflow (deepklox bug; run with "
-                "AIC_VLLM_DSV4_PREFILL_CHUNK_TOKENS=8192, or AIC_VLLM_DSV4_SKIP_PREFILL_OVERFLOW=0 once fixed)"
+                "fused sparse_mla_prefill int32 overflow (AIC_VLLM_DSV4_SKIP_PREFILL_OVERFLOW=1, for deepklox "
+                "builds without the int64-offset fix; AIC_VLLM_DSV4_PREFILL_CHUNK_TOKENS=8192 collects them)"
             )
         elif mode == "context" and _context_exceeds_memory(model_path, attn_kind, batch_size, query_len, tp_size):
             reason = f"estimated forward peak > {MAX_MEM_FRACTION:.0%} of device memory (XPU OOM = DEVICE_LOST)"
@@ -1533,8 +1591,8 @@ def main() -> None:
     query_len = args.seq_len if args.mode == "context" else 1
     if SKIP_PREFILL_OVERFLOW and _fused_prefill_overflows(args.model_path, args.batch_size, query_len, args.tp_size):
         raise SystemExit(
-            "shape overflows the fused sparse_mla_prefill int32 offsets (deepklox bug); set "
-            "AIC_VLLM_DSV4_PREFILL_CHUNK_TOKENS=8192, or AIC_VLLM_DSV4_SKIP_PREFILL_OVERFLOW=0 once fixed"
+            "shape overflows the fused sparse_mla_prefill int32 offsets and AIC_VLLM_DSV4_SKIP_PREFILL_OVERFLOW=1; "
+            "set AIC_VLLM_DSV4_PREFILL_CHUNK_TOKENS=8192 on deepklox builds without the int64-offset fix"
         )
     if args.mode == "context" and _context_exceeds_memory(
         args.model_path, args.attn_kind, args.batch_size, query_len, args.tp_size
