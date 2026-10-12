@@ -12,8 +12,12 @@
 #   OUT=<existing dir> bash 04_05_10_11_attention_context_generation.sh   # resume
 #
 # Results land in ./<outdir> under the current directory (perf.txt per op + logs).
-# Test case config: test_yaml/dsv4_attention.yaml — declared snapshot of the
-# active case yaml; the script fails loudly if it drifts from the repo copy.
+# Test case config: test_yaml/dsv4_attention.yaml — the 20261012
+# campaign-aligned case yaml (csa_ctx 1274 / csa_gen 1648 / swa_ctx 337 /
+# swa_gen 44; OOM/devlost statically removed; hca grid = repo original).
+# At startup the script deploys it over the repo's active base_ops yaml
+# (original auto-backed up once as .pristine-bak) and then fail-loud checks
+# sha256 drift between the two copies.
 set -euo pipefail
 
 # capture caller args BEFORE any sourcing: the oneAPI setvars chain leaves
@@ -38,7 +42,7 @@ unset DEEPKLOX_SPARSE_PREFILL_DISABLE_FUSED AIC_VLLM_DSV4_PREFILL_CHUNK_TOKENS \
       AIC_VLLM_DSV4_SKIP_PREFILL_OVERFLOW AIC_VLLM_DSV4_MAX_CUDAGRAPH_CAPTURE_SIZE \
       AIC_DSV4_PREFILL_TIMING AIC_DSV4_FLUSH_CACHE_MB AIC_VLLM_DSV4_MAX_MODEL_LEN
 
-# --- test case yaml: declared snapshot must match the repo's active config ---
+# --- test case yaml: deploy the campaign-aligned case set, then verify pairing ---
 TEST_YAML="${AIS_SCRIPT_DIR}/test_yaml/dsv4_attention.yaml"
 REPO_YAML="${AIS_ROOT}/collector/cases/base_ops/dsv4_attention.yaml"
 if [[ ! -f "${TEST_YAML}" ]]; then
@@ -47,8 +51,16 @@ if [[ ! -f "${TEST_YAML}" ]]; then
 fi
 if [[ "$(sha256sum < "${TEST_YAML}" | cut -d' ' -f1)" != \
       "$(sha256sum < "${REPO_YAML}" | cut -d' ' -f1)" ]]; then
+    # idempotent deploy: first run backs the repo original up once (.pristine-bak);
+    # restore = cp <yaml>.pristine-bak <yaml>  (or git checkout -- <yaml>)
+    [[ -f "${REPO_YAML}.pristine-bak" ]] || cp "${REPO_YAML}" "${REPO_YAML}.pristine-bak"
+    cp "${TEST_YAML}" "${REPO_YAML}"
+    echo ">>> deployed campaign case yaml over ${REPO_YAML} (backup: .pristine-bak)"
+fi
+if [[ "$(sha256sum < "${TEST_YAML}" | cut -d' ' -f1)" != \
+      "$(sha256sum < "${REPO_YAML}" | cut -d' ' -f1)" ]]; then
     echo "ERROR: test_yaml/dsv4_attention.yaml differs from ${REPO_YAML};" \
-         "refresh the snapshot from the repo copy" >&2
+         "deploy failed" >&2
     exit 2
 fi
 
