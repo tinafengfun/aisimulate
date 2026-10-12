@@ -8,6 +8,7 @@
 #   bash 04_05_10_11_attention_context_generation.sh                      # full grids
 #   bash 04_05_10_11_attention_context_generation.sh smoke                # smoke (sampled cases)
 #   bash 04_05_10_11_attention_context_generation.sh smoke dsv4_swa_generation_module
+#   bash 04_05_10_11_attention_context_generation.sh -d 1 smoke           # pin to a GPU
 #   OUT=<existing dir> bash 04_05_10_11_attention_context_generation.sh   # resume
 #
 # Results land in ./<outdir> under the current directory (perf.txt per op + logs).
@@ -19,8 +20,12 @@ set -euo pipefail
 # positional params behind (observed: $@ gains /opt/gfx-deps/dpcpp/lib/libintelocl.so)
 USER_ARGS=("$@")
 
-AIS_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-AIS_ROOT="$(cd -- "${AIS_SCRIPT_DIR}/.." && pwd)"
+source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
+
+AIS_GPU_DEFAULT="${GPU:-0}"
+AIS_GPU_HELP="GPU id this campaign runs on (never 4 - known segfault)"
+ais_parse_args "${USER_ARGS[@]}"
+USER_ARGS=("${EXTRA_ARGS[@]}")
 
 # --- environment: 20261012 campaign contract (pack off / SYCLTLA off / graph on) ---
 source /opt/gfx-deps/env.sh
@@ -32,8 +37,6 @@ export VLLM_XPU_MXFP8_USE_SYCLTLA=0
 unset DEEPKLOX_SPARSE_PREFILL_DISABLE_FUSED AIC_VLLM_DSV4_PREFILL_CHUNK_TOKENS \
       AIC_VLLM_DSV4_SKIP_PREFILL_OVERFLOW AIC_VLLM_DSV4_MAX_CUDAGRAPH_CAPTURE_SIZE \
       AIC_DSV4_PREFILL_TIMING AIC_DSV4_FLUSH_CACHE_MB AIC_VLLM_DSV4_MAX_MODEL_LEN
-
-export ZE_AFFINITY_MASK="${GPU:-0}"     # campaign pin; never use 4 (known segfault)
 
 # --- test case yaml: declared snapshot must match the repo's active config ---
 TEST_YAML="${AIS_SCRIPT_DIR}/test_yaml/dsv4_attention.yaml"
@@ -50,7 +53,7 @@ if [[ "$(sha256sum < "${TEST_YAML}" | cut -d' ' -f1)" != \
 fi
 
 export PYTHONPATH="${AIS_ROOT}${PYTHONPATH:+:$PYTHONPATH}"
-C="${AIS_ROOT}/collector/collect.py"
+C="${COLLECT_PY}"
 
 MODE="full"
 if [[ "${USER_ARGS[0]:-}" = "smoke" ]]; then
@@ -81,6 +84,6 @@ fi
 
 for op in ${OPS}; do
     echo "===== RUN ${op} (${MODE}) ====="
-    python3 "${C}" ${FLAGS} --ops "${op}" 2>&1 | tee -a "run_${op}_${ts}.log"
+    "${PYTHON}" "${C}" ${FLAGS} --ops "${op}" 2>&1 | tee -a "run_${op}_${ts}.log"
 done
 echo "ALL_OPS_DONE mode=${MODE} run_dir=$(pwd)"
