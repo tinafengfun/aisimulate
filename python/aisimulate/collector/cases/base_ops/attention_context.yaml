@@ -292,6 +292,9 @@ framework_specific_op_cases:
         - 10240
         - 12288
         - 16384
+        # Raise caps to cover the full b=256 x s=16384 prefill rectangle.
+        max_tokens_grouped_query_attention: 4194304
+        max_kv_elements: 17179869184
         query_head_counts:
         - 16
         - 64
@@ -302,9 +305,16 @@ framework_specific_op_cases:
         - 256
         window_sizes:
         - 0
+        # Only real model topologies: qwen3.6_35b_a3b (h16/kv2) and
+        # qwen3.8_2p4t_a95b (h64/kv4); avoid the (16,4)/(64,2) cross-product.
         head_profiles:
-        - id: default_head256
+        - id: default_head256_qwen3_6_35b_a3b
           head_dim: 256
           window_size: 0
-          query_head_counts: [16, 64]
-          kv_head_options: [2, 4]
+          query_head_counts: [16]
+          kv_head_options: [2]
+        - id: default_head256_qwen3_8_2p4t_a95b
+          head_dim: 256
+          window_size: 0
+          query_head_counts: [64]
+          kv_head_options: [4]

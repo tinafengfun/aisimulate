@@ -11,6 +11,8 @@ isolated context/generation attention kernels with synthetic KV-cache state.
 __compat__ = "vllm==0.28.0"
 
 import functools
+import inspect
+import json
 import math
 import os
 
@@ -35,7 +37,12 @@ try:
 except ImportError:
     from vllm.utils.torch_utils import is_torch_equal_or_newer
 
-from vllm.v1.attention.backends.utils import set_kv_cache_layout
+try:
+    from vllm.v1.attention.backends.utils import set_kv_cache_layout as _vllm_set_kv_cache_layout
+except ImportError:
+    # vLLM replaced the process-global setter with CacheConfig.kv_cache_layout
+    # (record_kv_cache_layout). Handled in _apply_kv_cache_layout below.
+    _vllm_set_kv_cache_layout = None
 from vllm.version import __version__ as vllm_version
 
 try:
@@ -107,6 +114,18 @@ def _forward_with_optional_kv_cache_update(
     return impl.forward(layer, query, key, value, kv_cache, attn_metadata, output=output)
 
 
+def _apply_kv_cache_layout(vllm_config, layout_name):
+    """Pin the KV cache layout for this process (layout_name=None clears it).
+
+    vLLM moved this from the process-global set_kv_cache_layout setter to a
+    CacheConfig field; on the new API assign the field directly.
+    """
+    if _vllm_set_kv_cache_layout is not None:
+        _vllm_set_kv_cache_layout(layout_name)
+        return
+    vllm_config.cache_config.kv_cache_layout = layout_name
+
+
 # https://github.com/vllm-project/vllm/tree/main/vllm/v1/attention/backends
 # support MHA GQA MQA bfloat16 tensor and bfloat16/fp8 kv cache
 
@@ -140,13 +159,29 @@ def run_attention_torch(
     model = os.path.join(os.path.dirname(__file__), "fake_hf_model")
     block_size = 64
 
+    # fp8 attn: enable the XPU FlashAttention backend's fp8-query input.
+    #
+    # attn_dtype="fp8" means *full* fp8 (fp8_e4m3 query AND fp8 KV cache), unlike
+    # "bfloat16" + use_fp8_kv_cache (bf16 Q, fp8 KV). FLASH_ATTN forwards q_descale
+    # only when supports_quant_query_input is set, which on XPU is gated by
+    # VLLM_XPU_SUPPORT_FP8_QUERY (default 0); scope it to fp8 cases only.
+    if attn_dtype == "fp8":
+        _prev_fp8_q = os.environ.get("VLLM_XPU_SUPPORT_FP8_QUERY")
+        os.environ["VLLM_XPU_SUPPORT_FP8_QUERY"] = "1"
+        exit_stack.callback(
+            lambda: os.environ.__setitem__("VLLM_XPU_SUPPORT_FP8_QUERY", _prev_fp8_q)
+            if _prev_fp8_q is not None
+            else os.environ.pop("VLLM_XPU_SUPPORT_FP8_QUERY", None)
+        )
+    selected_backend = None
+
     # Let vLLM choose the backend. Handle multiple historical signatures:
     # newest: (... use_mm_prefix=..., use_v1=True/False defaulted to True)
     # mid:    (... use_mm_prefix omitted)
     # old:    (... use_v1 required, no use_mm_prefix)
     try:
         backend = current_platform.get_attn_backend_cls(
-            None,
+            selected_backend,
             head_dim,
             dtype,
             kv_cache_dtype="fp8" if use_fp8_kv_cache else None,
@@ -159,7 +194,7 @@ def run_attention_torch(
     except TypeError:
         try:
             backend = current_platform.get_attn_backend_cls(
-                None,
+                selected_backend,
                 head_dim,
                 dtype,
                 kv_cache_dtype="fp8" if use_fp8_kv_cache else None,
@@ -171,7 +206,7 @@ def run_attention_torch(
         except TypeError:
             try:
                 backend = current_platform.get_attn_backend_cls(
-                    None,
+                    selected_backend,
                     head_dim,
                     dtype,
                     kv_cache_dtype="fp8" if use_fp8_kv_cache else None,
@@ -194,10 +229,10 @@ def run_attention_torch(
                         has_sink=has_sink,
                         use_sparse=False,
                     )
-                    backend = current_platform.get_attn_backend_cls(None, attn_selector_config)
+                    backend = current_platform.get_attn_backend_cls(selected_backend, attn_selector_config)
                 except Exception:
                     backend = current_platform.get_attn_backend_cls(
-                        None,
+                        selected_backend,
                         head_dim,
                         dtype,
                         kv_cache_dtype="fp8" if use_fp8_kv_cache else None,
@@ -215,6 +250,16 @@ def run_attention_torch(
         backend_name = LegacyBackendEnum[backend_name_str]
     else:
         backend_name = backend_name_str
+
+    # Fail loudly rather than silently mislabelling: fp8 needs a backend that
+    # forwards an fp8 query plus q_descale (FLASH_ATTN/FLASHINFER).
+    if attn_dtype == "fp8" and backend_name_str not in ("FLASH_ATTN", "FLASHINFER"):
+        raise RuntimeError(
+            f"attn_dtype='fp8' expects the FLASH_ATTN backend (it forwards an fp8 "
+            f"query and q_descale to vllm_xpu_kernels, the library the standalone "
+            f"sweep measures); vLLM resolved '{backend_name_str}' instead. Refusing "
+            f"to produce a row that is not comparable with the kernel sweep."
+        )
 
     if is_context_phase:
         batch_spec = BatchSpec(
@@ -308,11 +353,11 @@ def run_attention_torch(
         # physical stride order so those kernel views match serving.
         get_required_layout = getattr(backend_cls, "get_required_kv_cache_layout", None)
         if get_required_layout is not None:
-            set_kv_cache_layout(get_required_layout())
-            exit_stack.callback(set_kv_cache_layout, None)
+            _apply_kv_cache_layout(vllm_config, get_required_layout())
+            exit_stack.callback(_apply_kv_cache_layout, vllm_config, None)
         elif backend_name_str == "FLASHINFER":
-            set_kv_cache_layout("HND")
-            exit_stack.callback(set_kv_cache_layout, None)
+            _apply_kv_cache_layout(vllm_config, "HND")
+            exit_stack.callback(_apply_kv_cache_layout, vllm_config, None)
         stride_order = _get_backend_kv_cache_stride_order(backend_cls, 4)
         kv_cache = _pack_v1_fa_kv_cache(kv_cache, stride_order)
 
@@ -375,7 +420,7 @@ def run_attention_torch(
     # mirrors serving's num_attention_heads//tp_size; values arbitrary -- the sink is a
     # softmax-denominator bias, so magnitude is latency-invariant and only presence matters.
     sinks = torch.randn(num_heads, dtype=dtype, device=device) if has_sink else None
-    impl = impl_cls(
+    impl_kwargs = dict(
         num_heads=num_heads,
         head_size=head_dim,
         scale=scale,
@@ -383,11 +428,22 @@ def run_attention_torch(
         alibi_slopes=None,
         sliding_window=sliding_window,
         kv_cache_dtype="fp8" if use_fp8_kv_cache else "auto",
-        sinks=sinks,
     )
+    # Not every backend takes `sinks` (e.g. XPU_ATTN); pass it only when the
+    # impl accepts it, and refuse the case if a sink is actually required.
+    if "sinks" in inspect.signature(impl_cls.__init__).parameters:
+        impl_kwargs["sinks"] = sinks
+    elif sinks is not None:
+        raise RuntimeError(
+            f"has_sink=True but the resolved backend {backend_name_str} does not "
+            f"accept a `sinks` argument; measuring it without the sink would "
+            f"report the wrong kernel variant."
+        )
+    impl = impl_cls(**impl_kwargs)
 
-    # fp8 attn: set a static Q descale (amax/448) so the kernel quantizes the
-    # bf16 query to fp8 internally. Latency is scale-invariant.
+    # fp8 attn: layer._q_scale is the per-tensor descale (amax/448) that
+    # FlashAttentionImpl forwards to the kernel as q_descale. Latency is
+    # scale-invariant, so the exact value only matters for numerics.
     if attn_dtype == "fp8":
         amax = query_vllm.detach().abs().max().to(torch.float32)
         q_scale = float((amax / 448.0).clamp(min=1e-4))
@@ -401,10 +457,21 @@ def run_attention_torch(
     test_ite = int(os.getenv("AIC_ATTN_NUM_RUNS", "6"))
     warm_up = int(os.getenv("AIC_ATTN_WARMUP", "3"))
 
-    # XPU's FlashAttention implementation currently expects Query and Output
-    # to be bfloat16 even if the KV Cache is FP8.
-    # TODO: Remove the code if FP8 support will not be in the roadmap.
-    if "xpu" not in str(device) and use_fp8_kv_cache and backend_name_str in ("FLASH_ATTN", "FLASHINFER"):
+    # Hand the kernel a genuinely fp8 query (output is re-typed to 16-bit).
+    # Keyed on attn_dtype rather than the KV cache dtype so the bf16-Q + fp8-KV
+    # path (handled by the elif below) still converts only on non-XPU devices.
+    if attn_dtype == "fp8" and backend_name_str in ("FLASH_ATTN", "FLASHINFER"):
+        if not impl.supports_quant_query_input:
+            raise RuntimeError(
+                "attn_dtype='fp8' requires an fp8 query, but "
+                f"{backend_name_str} reports supports_quant_query_input=False, so "
+                "q_descale would be dropped. On XPU this flag comes from "
+                "VLLM_XPU_SUPPORT_FP8_QUERY; refusing to record a mislabelled row."
+            )
+        query_vllm = query_vllm.to(current_platform.fp8_dtype())
+        output = output.to(torch.bfloat16)
+    elif use_fp8_kv_cache and "xpu" not in str(device) and backend_name_str in ("FLASH_ATTN", "FLASHINFER"):
+        # Non-XPU devices want an fp8 query whenever the KV cache is fp8.
         query_vllm = query_vllm.to(current_platform.fp8_dtype())
         output = output.to(torch.bfloat16)
 
@@ -525,6 +592,45 @@ def _kv_pool_fits(num_kv_heads, head_dim):
     return pool <= _device_total_memory() * _KV_POOL_MEM_FRACTION
 
 
+# 32-bit index-overflow gates for the CRI vllm-xpu-kernel build. Operators differ
+# on purpose: paged-KV fails ABOVE 2**24 (>), query-elem fails AT 2**32 (>=).
+_PAGED_KV_MAX_TOKENS = 2 ** 24
+_QUERY_ELEM_LIMIT = 2 ** 32
+
+
+def _paged_kv_tokens(b, s):
+    required_blocks = 1 + b * ((s + _KV_BLOCK_SIZE - 1) // _KV_BLOCK_SIZE)
+    return max(_KV_POOL_BLOCKS, required_blocks) * _KV_BLOCK_SIZE
+
+
+def _exceeds_paged_kv_limit(b, s):
+    return _paged_kv_tokens(b, s) > _PAGED_KV_MAX_TOKENS
+
+
+def _exceeds_query_elem_limit(b, s, n, head_dim):
+    return b * s * n * head_dim >= _QUERY_ELEM_LIMIT
+
+
+# OOM guard: _kv_pool_fits only sizes the KV pool; also account for Q and O.
+_VRAM_BUDGET_FRACTION = 0.9
+_OUT_BYTES = 2
+
+
+def _activation_bytes(b, seq_q, seq_kv, n, num_kv_heads, head_dim, attn_dtype, is_fp8_kv):
+    q_bytes = 1 if attn_dtype == "fp8" else 2
+    kv_bytes = 1 if is_fp8_kv else 2
+    q_elems = b * seq_q * n * head_dim
+    kv_tokens = _paged_kv_tokens(b, seq_kv)
+    k_and_v = 2 * kv_tokens * num_kv_heads * head_dim * kv_bytes
+    return q_elems * q_bytes + q_elems * _OUT_BYTES + k_and_v
+
+
+def _activations_fit(b, seq_q, seq_kv, n, num_kv_heads, head_dim, attn_dtype, is_fp8_kv):
+    need = _activation_bytes(b, seq_q, seq_kv, n, num_kv_heads, head_dim,
+                             attn_dtype, is_fp8_kv)
+    return need <= _device_total_memory() * _VRAM_BUDGET_FRACTION
+
+
 def _collector_system():
     return os.environ.get("COLLECTOR_SYSTEM") or None
 
@@ -546,17 +652,57 @@ def _max_gqa_ratio():
 
 # (attn_compute_dtype, use_fp8_kv_cache) combos swept per system/phase. fp8 Q
 # compute on XPU requires an fp8 KV cache (the kernel couples them), so attn=fp8
-# only pairs with kv=fp8; attn=fp8/kv=bf16 is intentionally omitted. B60's kernel
-# is bf16-compute only. Generation is bf16 compute on every system.
+# only pairs with kv=fp8. B60's kernel is bf16-compute only. CRI now supports
+# full-fp8 decode as well, so generation includes the fp8 combo there.
 _ATTN_DTYPE_KV_COMBOS = {
     ("cri", "context"): [("bfloat16", False), ("bfloat16", True), ("fp8", True)],
-    ("cri", "generation"): [("bfloat16", False), ("bfloat16", True)],
+    ("cri", "generation"): [("bfloat16", False), ("bfloat16", True), ("fp8", True)],
 }
 _DEFAULT_ATTN_DTYPE_KV_COMBOS = [("bfloat16", False), ("bfloat16", True)]
 
 
 def _attn_dtype_kv_combos(phase):
-    return _ATTN_DTYPE_KV_COMBOS.get((_collector_system(), phase), _DEFAULT_ATTN_DTYPE_KV_COMBOS)
+    combos = _ATTN_DTYPE_KV_COMBOS.get((_collector_system(), phase), _DEFAULT_ATTN_DTYPE_KV_COMBOS)
+    if any(d == "fp8" for d, _ in combos) and not _fp8_attn_backend_available():
+        combos = [c for c in combos if c[0] != "fp8"]
+    return combos
+
+
+@functools.lru_cache(maxsize=1)
+def _fp8_attn_backend_available():
+    """True if this vLLM can actually run fp8-compute attention.
+
+    fp8 needs FlashAttentionImpl.supports_quant_query_input; if the platform has
+    no support_fp8_query() at all, drop the fp8 combos rather than record a
+    bf16-Q latency under an "fp8" label.
+    """
+    support = getattr(current_platform, "support_fp8_query", None)
+    if support is None:
+        print("attention_context: fp8 combos dropped -- this vLLM platform has no "
+              "support_fp8_query(), so an fp8 query cannot be dispatched")
+        return False
+    return True
+
+
+_UNSUPPORTED_JSON = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "attention_context_unsupported_xpu.json",
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _known_unsupported_context_shapes():
+    # Optional skip-list of shapes the CRI vllm-xpu-kernel build cannot execute
+    # (they hang the GPU with DEVICE_LOST rather than raising). Generated from
+    # the vllm-xpu-kernel sweep; absent file -> no shapes skipped.
+    if not os.path.isfile(_UNSUPPORTED_JSON):
+        return frozenset()
+    with open(_UNSUPPORTED_JSON) as f:
+        entries = json.load(f)
+    return frozenset(
+        (e["b"], e["s"], e["n"], e["kv_heads"], e["head_dim"], e["attn_dtype"], bool(e["fp8_kv"]))
+        for e in entries
+    )
 
 
 def _yaml_profiles_only():
@@ -568,6 +714,8 @@ def _yaml_profiles_only():
 def get_context_attention_test_cases(if_unit_test=False):
     test_cases = []
     _dropped_mem = 0
+    _dropped_unsupported = 0
+    _dropped_overflow = 0
 
     if if_unit_test:
         shape_sweeps = [
@@ -618,11 +766,8 @@ def get_context_attention_test_cases(if_unit_test=False):
                 continue
             for s in sorted(sequence_lengths, reverse=True):
                 for b in sorted(batch_sizes, reverse=True):
-                    # isl==1 (max_seqlen_q==1) forces the paged decode kernel,
-                    # uncompiled for head_dim=256 at GQA ratio>8. isl>=16 uses
-                    # chunk_prefill and is unaffected.
-                    if s == 1 and n // num_kv_heads > 8:
-                        continue
+                    # The old isl==1 GQA-ratio>8 skip is stale: _prefill_only_varlen
+                    # forces chunk_prefill, and the CRI build measures isl==1 fine.
                     if num_kv_heads == n:
                         if b * s > max_tokens_self_attention or b > 128:
                             continue
@@ -633,6 +778,20 @@ def get_context_attention_test_cases(if_unit_test=False):
                     for attn_dtype, is_fp8_kv_cache in dtype_combos:
                         if not _kv_pool_fits(num_kv_heads, head_dim):
                             _dropped_mem += 1
+                            continue
+                        if not _activations_fit(b, s, s, n, num_kv_heads, head_dim,
+                                                attn_dtype, is_fp8_kv_cache):
+                            _dropped_mem += 1
+                            continue
+                        if _exceeds_query_elem_limit(b, s, n, head_dim):
+                            _dropped_overflow += 1
+                            continue
+                        if _exceeds_paged_kv_limit(b, s):
+                            _dropped_overflow += 1
+                            continue
+                        if (b, s, n, num_kv_heads, head_dim, attn_dtype,
+                                is_fp8_kv_cache) in _known_unsupported_context_shapes():
+                            _dropped_unsupported += 1
                             continue
                         test_cases.append(
                             [
@@ -652,6 +811,15 @@ def get_context_attention_test_cases(if_unit_test=False):
     if _dropped_mem:
         dev_gb = get_device_module().get_device_properties(0).total_memory / 1e9
         print(f"attention_context: dropped {_dropped_mem} cases (KV-pool memory budget, device={dev_gb:.0f}GB)")
+    if _dropped_overflow:
+        print(f"attention_context: skipped {_dropped_overflow} cases (32-bit index "
+              f"overflow: >= {_QUERY_ELEM_LIMIT} query elements, or > "
+              f"{_PAGED_KV_MAX_TOKENS} paged-KV tokens -- this kernel build "
+              f"faults or returns silently wrong results there)")
+    if _dropped_unsupported:
+        print(f"attention_context: skipped {_dropped_unsupported} cases "
+              f"(known unsupported by this vllm-xpu-kernel build -- these hang the "
+              f"GPU with DEVICE_LOST; see {os.path.basename(_UNSUPPORTED_JSON)})")
 
     return test_cases
 
@@ -681,8 +849,9 @@ def _generation_target_sequence_lengths(batch_sizes, sequence_lengths, num_heads
 def get_generation_attention_test_cases():
     test_cases = []
     _dropped_mem = 0
+    _dropped_overflow = 0
 
-    # (attn_compute_dtype, use_fp8_kv_cache) combos; generation is bf16 compute.
+    # (attn_compute_dtype, use_fp8_kv_cache) combos; fp8 attn compute only on CRI.
     dtype_combos = _attn_dtype_kv_combos("generation")
     # XPU paged flash attention GQA ratio ceiling (wider on CRI).
     max_gqa_ratio = _max_gqa_ratio()
@@ -726,6 +895,16 @@ def get_generation_attention_test_cases():
                         if not _kv_pool_fits(n_kv, head_dim):
                             _dropped_mem += 1
                             continue
+                        # Decode issues one query token per sequence, so only the
+                        # paged-KV token limit can bite (and it returns silently
+                        # wrong results past 2**24 tokens with no error).
+                        if _exceeds_paged_kv_limit(b, s):
+                            _dropped_overflow += 1
+                            continue
+                        if not _activations_fit(b, 1, s, n, n_kv, head_dim,
+                                                attn_dtype, is_fp8_kv_cache):
+                            _dropped_mem += 1
+                            continue
                         test_cases.append(
                             [
                                 b,
@@ -743,6 +922,10 @@ def get_generation_attention_test_cases():
     if _dropped_mem:
         dev_gb = get_device_module().get_device_properties(0).total_memory / 1e9
         print(f"attention_generation: dropped {_dropped_mem} cases (KV-pool memory budget, device={dev_gb:.0f}GB)")
+    if _dropped_overflow:
+        print(f"attention_generation: skipped {_dropped_overflow} cases (paged-KV "
+              f"pool > {_PAGED_KV_MAX_TOKENS} tokens -- this kernel build returns "
+              f"silently wrong results there, with no error raised)")
     return test_cases
 
 
