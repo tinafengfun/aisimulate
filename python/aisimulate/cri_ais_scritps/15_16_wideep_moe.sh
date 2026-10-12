@@ -9,6 +9,6 @@ ais_parse_args "$@"
 # moe_ep is collected on a single physical rank: the logical EP world size
 # comes from the case definition, not from the number of visible GPUs
 # (collector/vllm/collect_moe.py:595-601).
-ZE_AFFINITY_MASK="${ZE_AFFINITY_MASK}" VLLM_XPU_ENABLE_XPU_GRAPH=1 \
+VLLM_XPU_ENABLE_XPU_GRAPH=1 \
     "${PYTHON}" "${COLLECT_PY}" \
     --backend vllm --ops moe_ep --gpu cri --keep-csv "${EXTRA_ARGS[@]}"
