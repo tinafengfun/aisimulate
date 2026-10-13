@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
+export CCL_SELECTION_POLICY="$(pwd)/cri_ce+chunking_policy.json"
 
 AIS_GPU_DEFAULT=
 AIS_GPU_HELP="comma-separated GPU ids to run the collectives on, e.g. 0,1,2,3"
