@@ -102,27 +102,27 @@ def _grid_y(phase, batch_size, num_tokens, num_v_heads):
     return batch_size * num_v_heads
 
 
-def _decode_pack_n(common_log_data):
-    """Kernels to pack per decode graph: fp32 ssm-state bytes vs amortize threshold, pow2 1..64."""
+def _decode_pack_n(state_bytes):
+    """Kernels to pack per decode graph: this op's own per-replay state bytes vs amortize threshold, pow2 1..64.
+
+    state_bytes must be the byte size of *this* kernel's per-request recurrent
+    state (conv_state for conv, ssm_state for the scan) -- they differ by
+    ~40x, so a shared estimate collapses pack_n for the smaller-state kernel
+    far earlier than its own memory budget would allow, under-amortizing the
+    XPU-graph replay overhead for that op.
+    """
     system = os.environ.get("COLLECTOR_SYSTEM") or None
     amortize = _LAUNCH_AMORTIZE_BYTES.get(system, _LAUNCH_AMORTIZE_BYTES_DEFAULT)
-    state_bytes = (
-        common_log_data["batch_size"]
-        * common_log_data["num_v_heads"]
-        * common_log_data["head_v_dim"]
-        * common_log_data["head_k_dim"]
-        * 4  # ssm_state is fp32
-    )
     raw = min(float(_PACK_N_MAX), max(1.0, amortize / max(state_bytes, 1)))
     return min(_PACK_N_MAX, max(1, 1 << round(math.log2(raw))))
 
 
-def _benchmark(kernel_func, device, common_log_data, kernel_source, perf_filename, *, phase):
+def _benchmark(kernel_func, device, common_log_data, kernel_source, perf_filename, *, phase, state_bytes=0):
     """Time one op and log a row. Context: eager, repeat_n=10 (NV parity). Generation: graph, pack_n per replay."""
     use_graph = xpu_graph_measure_enabled() and phase != "context"
 
     if use_graph:
-        pack_n = _decode_pack_n(common_log_data)
+        pack_n = _decode_pack_n(state_bytes)
         repeat_n = 1
 
         def run():
@@ -324,7 +324,19 @@ def _run_phase(
                         activation="silu",
                     )
 
-                _benchmark(run_conv, device, common_log_data, "causal_conv1d_update", perf_filename, phase=phase)
+                # conv_state bytes per request (bf16) -- ~40x smaller than the
+                # ssm_state used below, so it earns a much larger pack_n at
+                # the same batch size (see _decode_pack_n).
+                conv_state_bytes = batch_size * taps * conv_dim * conv_state.element_size()
+                _benchmark(
+                    run_conv,
+                    device,
+                    common_log_data,
+                    "causal_conv1d_update",
+                    perf_filename,
+                    phase=phase,
+                    state_bytes=conv_state_bytes,
+                )
                 del conv_x, conv_state
                 gc.collect()
                 get_device_module().empty_cache()
@@ -365,7 +377,17 @@ def _run_phase(
                         initial_state_indices=state_indices,
                     )
 
-                _benchmark(run_scan, device, common_log_data, "gated_delta_rule_decode", perf_filename, phase=phase)
+                # fp32 ssm_state bytes per request (V-major [HV, V, K]).
+                ssm_state_bytes = batch_size * num_v_heads * head_v_dim * head_k_dim * ssm_state.element_size()
+                _benchmark(
+                    run_scan,
+                    device,
+                    common_log_data,
+                    "gated_delta_rule_decode",
+                    perf_filename,
+                    phase=phase,
+                    state_bytes=ssm_state_bytes,
+                )
                 del q, k, v, a_log, dt_bias, a, b, ssm_state
                 gc.collect()
                 get_device_module().empty_cache()
