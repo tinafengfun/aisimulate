@@ -1,0 +1,704 @@
+schema_version: 1
+op: dsv4_attention
+description: 'Campaign-aligned DSV4 csa/swa grids (20261012 campaign executed set: OOM/devlost cases statically removed per
+  configs/exclusions.yaml; csa_ctx 1274 / csa_gen 1648 / swa_ctx 337 / swa_gen 44) + the hca grid of this repo preserved unchanged
+  (attn_kinds narrowed to [hca]). Do not hand-edit; see doc/dsv4_attention_ww42_script_delivery_20261012.md.'
+common_case_values:
+  dsv4_module_budgets:
+    max_seq_len: 65536
+    max_context_query_tokens: 262144
+    max_generation_kv_tokens: 1048576
+    decode_batch_ladder:
+    - - 524288
+      - 1
+    - - 262144
+      - 2
+    - - 131072
+      - 4
+    - - 65536
+      - 8
+    - - 32768
+      - 16
+    - - 8192
+      - 64
+  dsv4_xpu_attention:
+    grids:
+    - attn_kinds:
+      - csa
+      model_paths:
+      - deepseek-ai/DeepSeek-V4-Flash
+      gemm_types:
+      - mxfp8
+      tp_sizes:
+      - 1
+      context_batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      context_sequence_lengths:
+      - 1
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 1536
+      - 2048
+      - 3072
+      - 4096
+      - 6144
+      - 8192
+      context_prefix_lengths:
+      - 0
+      generation_batch_sizes: []
+      generation_steps: []
+      max_batch_tokens: 524288
+    - attn_kinds:
+      - csa
+      model_paths:
+      - deepseek-ai/DeepSeek-V4-Flash
+      gemm_types:
+      - mxfp8
+      tp_sizes:
+      - 2
+      context_batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      context_sequence_lengths:
+      - 1
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 1536
+      - 2048
+      - 3072
+      - 4096
+      - 6144
+      - 8192
+      context_prefix_lengths:
+      - 0
+      generation_batch_sizes: []
+      generation_steps: []
+      max_batch_tokens: 786432
+    - attn_kinds:
+      - csa
+      model_paths:
+      - deepseek-ai/DeepSeek-V4-Pro
+      gemm_types:
+      - mxfp8
+      tp_sizes:
+      - 1
+      context_batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      context_sequence_lengths:
+      - 1
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 1536
+      - 2048
+      - 3072
+      - 4096
+      - 6144
+      - 8192
+      context_prefix_lengths:
+      - 0
+      generation_batch_sizes: []
+      generation_steps: []
+      max_batch_tokens: 262144
+    - attn_kinds:
+      - csa
+      model_paths:
+      - deepseek-ai/DeepSeek-V4-Pro
+      gemm_types:
+      - mxfp8
+      tp_sizes:
+      - 2
+      context_batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      context_sequence_lengths:
+      - 1
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 1536
+      - 2048
+      - 3072
+      - 4096
+      - 6144
+      - 8192
+      context_prefix_lengths:
+      - 0
+      generation_batch_sizes: []
+      generation_steps: []
+      max_batch_tokens: 524288
+    - attn_kinds:
+      - csa
+      model_paths:
+      - deepseek-ai/DeepSeek-V4-Pro
+      gemm_types:
+      - mxfp8
+      tp_sizes:
+      - 4
+      context_batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      context_sequence_lengths:
+      - 1
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 1536
+      - 2048
+      - 3072
+      - 4096
+      - 6144
+      - 8192
+      context_prefix_lengths:
+      - 0
+      generation_batch_sizes: []
+      generation_steps: []
+      max_batch_tokens: 786432
+    - attn_kinds:
+      - csa
+      model_paths:
+      - deepseek-ai/DeepSeek-V4-Pro
+      gemm_types:
+      - mxfp8
+      tp_sizes:
+      - 8
+      context_batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      context_sequence_lengths:
+      - 1
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 1536
+      - 2048
+      - 3072
+      - 4096
+      - 6144
+      context_prefix_lengths:
+      - 0
+      generation_batch_sizes: []
+      generation_steps: []
+      max_batch_tokens: 1048576
+    - attn_kinds:
+      - csa
+      model_paths:
+      - deepseek-ai/DeepSeek-V4-Pro
+      gemm_types:
+      - mxfp8
+      tp_sizes:
+      - 8
+      context_batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      context_sequence_lengths:
+      - 8192
+      context_prefix_lengths:
+      - 0
+      generation_batch_sizes: []
+      generation_steps: []
+      max_batch_tokens: 1048576
+    - attn_kinds:
+      - swa
+      model_paths:
+      - deepseek-ai/DeepSeek-V4-Flash
+      gemm_types:
+      - mxfp8
+      tp_sizes:
+      - 1
+      context_batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      context_sequence_lengths:
+      - 1
+      - 16
+      - 64
+      - 128
+      - 256
+      - 1024
+      - 2048
+      - 4096
+      context_prefix_lengths:
+      - 0
+      generation_batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      generation_steps:
+      - 127
+      max_batch_tokens: 524288
+    - attn_kinds:
+      - csa
+      model_paths:
+      - deepseek-ai/DeepSeek-V4-Flash
+      gemm_types:
+      - mxfp8
+      tp_sizes:
+      - 4
+      context_batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      context_sequence_lengths:
+      - 1
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 1536
+      - 2048
+      - 3072
+      - 4096
+      - 6144
+      - 8192
+      context_prefix_lengths:
+      - 0
+      generation_batch_sizes: []
+      generation_steps: []
+      max_batch_tokens: 1048576
+    - attn_kinds:
+      - csa
+      model_paths:
+      - deepseek-ai/DeepSeek-V4-Flash
+      gemm_types:
+      - mxfp8
+      tp_sizes:
+      - 8
+      context_batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      context_sequence_lengths:
+      - 1
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 1536
+      - 2048
+      - 3072
+      - 4096
+      - 6144
+      - 8192
+      context_prefix_lengths:
+      - 0
+      generation_batch_sizes: []
+      generation_steps: []
+      max_batch_tokens: 1048576
+    - attn_kinds:
+      - swa
+      model_paths:
+      - deepseek-ai/DeepSeek-V4-Flash
+      gemm_types:
+      - mxfp8
+      tp_sizes:
+      - 2
+      context_batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      context_sequence_lengths:
+      - 1
+      - 16
+      - 64
+      - 128
+      - 256
+      - 1024
+      - 2048
+      - 4096
+      context_prefix_lengths:
+      - 0
+      generation_batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      generation_steps:
+      - 127
+      max_batch_tokens: 1048576
+    - attn_kinds:
+      - swa
+      model_paths:
+      - deepseek-ai/DeepSeek-V4-Flash
+      gemm_types:
+      - mxfp8
+      tp_sizes:
+      - 4
+      context_batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      context_sequence_lengths:
+      - 1
+      - 16
+      - 64
+      - 128
+      - 256
+      - 1024
+      - 2048
+      - 4096
+      context_prefix_lengths:
+      - 0
+      generation_batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      generation_steps:
+      - 127
+      max_batch_tokens: 1048576
+    - attn_kinds:
+      - swa
+      model_paths:
+      - deepseek-ai/DeepSeek-V4-Flash
+      gemm_types:
+      - mxfp8
+      tp_sizes:
+      - 8
+      context_batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      context_sequence_lengths:
+      - 1
+      - 16
+      - 64
+      - 128
+      - 256
+      - 1024
+      - 2048
+      - 4096
+      context_prefix_lengths:
+      - 0
+      generation_batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      generation_steps:
+      - 127
+      max_batch_tokens: 1048576
+    - attn_kinds:
+      - csa
+      model_paths:
+      - deepseek-ai/DeepSeek-V4-Flash
+      - deepseek-ai/DeepSeek-V4-Pro
+      gemm_types:
+      - mxfp8
+      tp_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      context_batch_sizes: []
+      context_sequence_lengths: []
+      context_prefix_lengths:
+      - 0
+      generation_batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      generation_steps:
+      - 1
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 1536
+      - 2048
+      - 3072
+      - 4096
+      - 6144
+      - 8192
+      - 10240
+      - 12288
+      - 16384
+      - 32768
+      - 65536
+      - 131072
+      - 262144
+      - 524288
+      - 1048575
+      max_batch_tokens: 1048576
+    - attn_kinds:
+      - hca
+      model_paths:
+      - deepseek-ai/DeepSeek-V4-Flash
+      - deepseek-ai/DeepSeek-V4-Pro
+      gemm_types:
+      - mxfp8
+      tp_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      context_batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      context_sequence_lengths:
+      - 1
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 1536
+      - 2048
+      - 3072
+      - 4096
+      - 6144
+      - 8192
+      context_prefix_lengths:
+      - 0
+      generation_batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      generation_steps:
+      - 1
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 1536
+      - 2048
+      - 3072
+      - 4096
+      - 6144
+      - 8192
+      - 10240
+      - 12288
+      - 16384
+      - 32768
+      - 65536
+      - 131072
+      - 262144
+      - 524288
+      - 1048575
+      max_batch_tokens: 1048576
