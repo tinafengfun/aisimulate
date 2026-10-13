@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# 04_05_attention.sh — DSV4 swa (mla-labeled) context+generation collection on CRI (XPU).
+# 04_05_mla_attention.sh — DSV4 swa (mla-labeled) context+generation collection on CRI (XPU).
 # Split from 04_05_10_11_attention_context_generation.sh; case labels keep the
 # ops_benchmark numbering and are DISPLAY-ONLY (04 mla_context / 05
 # mla_generation map to the swa module ops; collect.py always receives the
 # real op names).
 #
 # Usage (inside the GPU container):
-#   bash 04_05_attention.sh                    # both cases (04 + 05), full grids
-#   bash 04_05_attention.sh --case 4           # one case
-#   bash 04_05_attention.sh --case 4,5         # both, explicit
-#   bash 04_05_attention.sh -d 2               # pin GPU (never 4)
-#   bash 04_05_attention.sh -s                 # smoke grids (skips count gate)
-#   bash 04_05_attention.sh -h                 # help with the case table
+#   bash 04_05_mla_attention.sh                    # both cases (04 + 05), full grids
+#   bash 04_05_mla_attention.sh --case 4           # one case
+#   bash 04_05_mla_attention.sh --case 4,5         # both, explicit
+#   bash 04_05_mla_attention.sh -d 2               # pin GPU (never 4)
+#   bash 04_05_mla_attention.sh -s                 # smoke grids (skips count gate)
+#   bash 04_05_mla_attention.sh -h                 # help with the case table
 #
 # Each case runs in its own results dir <label>_<YYYYMMDD_HHMMSS>/ (run_env
 # log + perf.txt + csv staging + collector logs, checkpoint isolated per

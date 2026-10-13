@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# 10_11_attention.sh — DSV4 csa context+generation collection on CRI (XPU).
+# 10_11_csa_attention.sh — DSV4 csa context+generation collection on CRI (XPU).
 # Split from 04_05_10_11_attention_context_generation.sh; case labels keep the
 # ops_benchmark numbering and are DISPLAY-ONLY (10 csa_context / 11
 # csa_generation map to the csa module ops; collect.py always receives the
 # real op names).
 #
 # Usage (inside the GPU container):
-#   bash 10_11_attention.sh                    # both cases (10 + 11), full grids
-#   bash 10_11_attention.sh --case 10          # one case
-#   bash 10_11_attention.sh --case 10,11       # both, explicit
-#   bash 10_11_attention.sh -d 2               # pin GPU (never 4)
-#   bash 10_11_attention.sh -s                 # smoke grids (skips count gate)
-#   bash 10_11_attention.sh -h                 # help with the case table
+#   bash 10_11_csa_attention.sh                    # both cases (10 + 11), full grids
+#   bash 10_11_csa_attention.sh --case 10          # one case
+#   bash 10_11_csa_attention.sh --case 10,11       # both, explicit
+#   bash 10_11_csa_attention.sh -d 2               # pin GPU (never 4)
+#   bash 10_11_csa_attention.sh -s                 # smoke grids (skips count gate)
+#   bash 10_11_csa_attention.sh -h                 # help with the case table
 #
 # Each case runs in its own results dir <label>_<YYYYMMDD_HHMMSS>/ (run_env
 # log + perf.txt + csv staging + collector logs, checkpoint isolated per
