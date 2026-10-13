@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# 10_11_attention.sh — DSV4 csa context+generation collection on CRI (XPU).
+# Split from 04_05_10_11_attention_context_generation.sh; case labels keep the
+# ops_benchmark numbering and are DISPLAY-ONLY (10 csa_context / 11
+# csa_generation map to the csa module ops; collect.py always receives the
+# real op names).
+#
+# Usage (inside the GPU container):
+#   bash 10_11_attention.sh                    # both cases (10 + 11), full grids
+#   bash 10_11_attention.sh --case 10          # one case
+#   bash 10_11_attention.sh --case 10,11       # both, explicit
+#   bash 10_11_attention.sh -d 2               # pin GPU (never 4)
+#   bash 10_11_attention.sh -s                 # smoke grids (skips count gate)
+#   bash 10_11_attention.sh -h                 # help with the case table
+#
+# Each case runs in its own results dir <label>_<YYYYMMDD_HHMMSS>/ (run_env
+# log + perf.txt + csv staging + collector logs, checkpoint isolated per
+# case). Case yaml: test_yaml/dsv4_attention.yaml is backed up once
+# (.pristine-bak), deployed over collector/cases/base_ops/dsv4_attention.yaml
+# for the run, and restored on exit — including Ctrl+C (SIGINT/SIGTERM) and
+# errors. Not restored on SIGKILL/power loss (documented limit); restore is
+# idempotent — rerun this script, or `cp <yaml>.pristine-bak <yaml>`.
+#
+# Startup gates: full mode asserts the expanded case grid equals the
+# campaign-pinned counts (1274/1648/337/44) before any GPU work; GPU 4 is
+# rejected (known segfault).
+set -euo pipefail
+
+# capture caller args BEFORE any sourcing: the oneAPI setvars chain leaves
+# positional params behind (observed: $@ gains /opt/gfx-deps/dpcpp/lib/libintelocl.so)
+USER_ARGS=("$@")
+
+source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
+source "$(dirname -- "${BASH_SOURCE[0]}")/attention_common.sh"
+
+AIS_GPU_DEFAULT="${GPU:-0}"
+AIS_GPU_HELP="GPU id this campaign runs on (never 4 - known segfault)"
+
+ais_att_usage() {
+    cat >&2 <<EOF
+Usage: bash $(basename "$0") [--case 10|11|10,11] [--all] [-d <gpu>] [-o <dir>] [-s]
+
+Cases (labels = ops_benchmark numbering, display-only; the collector always
+receives the real op name):
+  10  csa_context     -> dsv4_csa_context_module
+  11  csa_generation  -> dsv4_csa_generation_module
+  --all               both cases (default when neither --case nor --all given)
+
+  -d, --device <gpu>  ${AIS_GPU_HELP:-GPU id} (default: ${AIS_GPU_DEFAULT:-all})
+  -o, --outdir <dir>  parent results dir; per-case subdirs land here
+                      (default: script dir)
+  -s, --smoke         sampled smoke grids (case-count gate skipped)
+  -h, --help          this help
+
+Each case gets its own <label>_<YYYYMMDD_HHMMSS>/ results dir. The case yaml
+is restored on exit, including Ctrl+C and errors (not on SIGKILL).
+EOF
+}
+
+for a in "${USER_ARGS[@]}"; do
+    if [[ "$a" == "-h" || "$a" == "--help" ]]; then
+        ais_att_usage
+        exit 0
+    fi
+done
+
+ais_parse_args "${USER_ARGS[@]}"
+USER_ARGS=("${EXTRA_ARGS[@]}")
+
+ais_att_parse_cases "10 11" "${USER_ARGS[@]}"
+
+TEST_YAML="${AIS_SCRIPT_DIR}/test_yaml/dsv4_attention.yaml"
+REPO_YAML="${AIS_ROOT}/collector/cases/base_ops/dsv4_attention.yaml"
+AIS_ATT_REPO_YAML="${REPO_YAML}"
+trap ais_att_cleanup EXIT
+trap 'ais_att_on_signal 130' INT
+trap 'ais_att_on_signal 143' TERM
+
+ais_att_env
+
+ais_att_yaml_deploy "${TEST_YAML}" "${REPO_YAML}"
+
+MODE="full"
+[[ "${AIS_SMOKE}" = 1 ]] && MODE="smoke"
+if [[ "${MODE}" = "full" ]]; then
+    # P0 gate: expanded grid must equal the campaign-pinned case counts
+    local_ops=()
+    for n in "${AIS_ATT_CASES[@]}"; do local_ops+=("${AIS_ATT_CASE_OP[$n]}"); done
+    ais_att_assert_case_counts "${local_ops[@]}"
+    AIS_ATT_FLAGS=(--backend vllm --gpu cri --keep-csv --resume --resume-retry-failed)
+else
+    AIS_ATT_FLAGS=(--backend vllm --gpu cri --smoke --keep-csv)
+fi
+
+echo ">>> mode=${MODE} cases: ${AIS_ATT_CASES[*]}"
+for n in "${AIS_ATT_CASES[@]}"; do
+    ais_att_run_case "$n"
+done
+
+ais_att_yaml_restore "${REPO_YAML}"
+echo "ATT_CASES_DONE mode=${MODE} cases=${AIS_ATT_CASES[*]} run_dir=$(pwd)"
