@@ -1,4 +1,4 @@
-From 46625f79e042c78c6e9aba7ee64b3b8ecd9acd33 Mon Sep 17 00:00:00 2001
+From 2c7f524a419223b3a03c420c38b9b3b606fa03a0 Mon Sep 17 00:00:00 2001
 From: "Zhang, Yanli L" <yanli.l.zhang@intel.com>
 Date: Mon, 12 Oct 2026 07:23:08 +0000
 Subject: [PATCH] feat(gdn/xpu): expose the DeepKLOX GDN kernels
@@ -8,29 +8,43 @@ so the XPU GDN kernels in DeepKLOX had no import path and callers that
 want them -- the AIS collector benchmarks each GDN op in isolation --
 failed with ModuleNotFoundError.
 
-Forward the four primitives plus gdn_prefill_backend(), which reports
+Forward both conv families, the two scan primitives, the one-off
+causal_conv1d_prepare_weight, and gdn_prefill_backend(), which reports
 xe3p/xe2 via DeepKLOX's own is_xe3p_arch/is_xe2_arch probes, the same
 ones its C++ dispatch calls, so the reported backend always names the
 kernel the call reaches.
+
+Both conv families are needed because they are different kernels, not
+two spellings of one. causal_conv1d_varlen / causal_conv1d_varlen_update
+are the plain depthwise causal conv + activation, matching what the CUDA
+GDN layers call (mamba/ops/causal_conv1d.py), so a caller can time or
+run the same op on both vendors. causal_conv1d_fn / causal_conv1d_update
+additionally fuse the Q/K/V split and the Q/K L2 norm; that is the pair
+vllm/_xpu_ops.py drives in serving. Their support surfaces differ too:
+on Xe3p the fused prefill kernel requires apply_qkv_split=True and
+sequence lengths divisible by 64, and the fused decode kernel rejects
+both the split and the norm, while the varlen pair takes every shape.
 
 Forwarding only: DeepKLOX keeps validation and dispatch, so the two
 cannot drift. DeepKLOX is optional, hence the explicit ImportError and
 no package-scope import.
 
-Verified on GPU3: 409 rows, 0 errors, labelled chunk_gated_delta_rule_xe3p.
+Verified on GPU0 (Xe3p) through the AIS GDN collector: 436 rows, 0
+errors, conv rows on the varlen pair and the scan labelled
+chunk_gated_delta_rule_xe3p.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 ---
- .../layers/mamba/gdn/deepklox_interface.py    | 60 +++++++++++++++++++
- 1 file changed, 60 insertions(+)
+ .../layers/mamba/gdn/deepklox_interface.py    | 74 +++++++++++++++++++
+ 1 file changed, 74 insertions(+)
  create mode 100644 vllm/model_executor/layers/mamba/gdn/deepklox_interface.py
 
 diff --git a/vllm/model_executor/layers/mamba/gdn/deepklox_interface.py b/vllm/model_executor/layers/mamba/gdn/deepklox_interface.py
 new file mode 100644
-index 0000000000..0831135d6c
+index 0000000000..1a98a704f7
 --- /dev/null
 +++ b/vllm/model_executor/layers/mamba/gdn/deepklox_interface.py
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,74 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""GDN primitives backed by DeepKLOX (XPU).
@@ -42,8 +56,16 @@ index 0000000000..0831135d6c
 +names for callers that want the XPU path explicitly -- currently the
 +AIS collector, which benchmarks each GDN op in isolation:
 +
-+* context: ``causal_conv1d_fn`` + ``chunk_gated_delta_rule``
-+* generation: ``causal_conv1d_update`` + ``gated_delta_rule_decode``
++* context: ``causal_conv1d_varlen`` + ``chunk_gated_delta_rule``
++* generation: ``causal_conv1d_varlen_update`` + ``gated_delta_rule_decode``
++
++Both conv families are forwarded. The ``*_varlen*`` pair is the plain
++depthwise causal conv + activation, which is what the CUDA GDN layers
++call (``mamba/ops/causal_conv1d.py``); ``causal_conv1d_fn`` /
++``causal_conv1d_update`` are the XPU-only variants that additionally fuse
++the Q/K/V split and the Q/K L2 norm. They are separate kernels with
++different support surfaces, so both names stay exposed and the caller
++picks.
 +
 +This is a forwarding layer and deliberately nothing more. DeepKLOX owns
 +argument validation, dtype/layout checks and the architecture dispatch,
@@ -62,7 +84,10 @@ index 0000000000..0831135d6c
 +
 +from deepklox import (  # noqa: E402
 +    causal_conv1d_fn,
++    causal_conv1d_prepare_weight,
 +    causal_conv1d_update,
++    causal_conv1d_varlen,
++    causal_conv1d_varlen_update,
 +    chunk_gated_delta_rule,
 +    gated_delta_rule_decode,
 +)
@@ -86,12 +111,14 @@ index 0000000000..0831135d6c
 +
 +__all__ = [
 +    "causal_conv1d_fn",
++    "causal_conv1d_prepare_weight",
 +    "causal_conv1d_update",
++    "causal_conv1d_varlen",
++    "causal_conv1d_varlen_update",
 +    "chunk_gated_delta_rule",
 +    "gated_delta_rule_decode",
 +    "gdn_prefill_backend",
 +]
-
 base-commit: e3e075508d506a721093dcd0aa94ac2e32811fda
 -- 
 2.43.0

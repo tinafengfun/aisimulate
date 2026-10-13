@@ -5,12 +5,26 @@
 
 Times the two production core ops separately, matching the NVIDIA collector:
 the packed-QKV depthwise convolution and the gated-delta-rule scan. Context
-uses ``causal_conv1d_fn`` + ``chunk_gated_delta_rule``; generation uses
-``causal_conv1d_update`` + ``gated_delta_rule_decode``. Input/output projection
-GEMMs stay with the GEMM collector.
+uses ``causal_conv1d_varlen`` + ``chunk_gated_delta_rule``; generation uses
+``causal_conv1d_varlen_update`` + ``gated_delta_rule_decode``. Input/output
+projection GEMMs stay with the GEMM collector.
 
-The per-op GDN primitives are imported from vLLM-XPU's
-``mamba.gdn.deepklox_interface``, which dispatches each op to DeepKLOX for now
+The conv rows use DeepKLOX's ``*_varlen*`` pair rather than its GDN-fused
+``causal_conv1d_fn``/``causal_conv1d_update``, because the varlen pair computes
+exactly what the CUDA collector times -- depthwise causal conv + SiLU over a
+packed varlen batch, no Q/K/V split and no Q/K L2 norm
+(``vllm/model_executor/layers/mamba/ops/causal_conv1d.py``). The fused variants
+do strictly more work (verified: 2.09 ms vs 0.80 ms at bs=4 x seq=2048,
+conv_dim=10240), so timing them against the CUDA row would overstate the gap by
+work the CUDA row never does. Their Xe3p support surfaces also disagree -- the
+fused prefill kernel requires ``apply_qkv_split=True`` and sequence lengths
+divisible by 64, the fused decode kernel rejects both the split and the norm --
+whereas the varlen pair takes every shape in the sweep. The fused path is what
+vLLM-XPU serving calls (``vllm/_xpu_ops.py``); its extra split+norm cost is a
+model-level concern, not part of this op's cross-vendor row.
+
+The primitives are imported from vLLM-XPU's ``mamba.gdn.deepklox_interface``,
+which dispatches each op to DeepKLOX for now.
 """
 
 __compat__ = "vllm==0.28.0"
@@ -21,8 +35,9 @@ import os
 
 import torch
 from vllm.model_executor.layers.mamba.gdn.deepklox_interface import (
-    causal_conv1d_fn,
-    causal_conv1d_update,
+    causal_conv1d_prepare_weight,
+    causal_conv1d_varlen,
+    causal_conv1d_varlen_update,
     chunk_gated_delta_rule,
     gated_delta_rule_decode,
     gdn_prefill_backend,
@@ -44,7 +59,6 @@ aic_debug = int(os.getenv("aic_gdn_debug", "0"))  # noqa: SIM112
 # DEVICE_LOST that kills the worker), so pre-skip offending shapes.
 _GRID_Y_LIMIT = int(os.getenv("aic_gdn_grid_y_limit", str(65535)))  # noqa: SIM112
 _CTX_CHUNK = 128  # chunk length of the context (prefill) scan kernel
-_CTX_SEQ_MULTIPLE = 64  # Xe3p prefill conv requires each sequence length divisible by 64
 _CONV_ELEM_LIMIT = 2**31  # packed conv (num_tokens*conv_dim) element ceiling; NV int32-offset parity
 
 # Per COLLECTOR_SYSTEM: CRI needs the larger window, b60 keeps the smaller default.
@@ -175,6 +189,9 @@ def _run_phase(
     scale = head_k_dim**-0.5
     backend = gdn_prefill_backend(device)  # prefill scan specialization (xe3p/xe2)
     conv_weight = torch.randn(conv_dim, d_conv, dtype=dtype, device=device)
+    # The kernels read the weight tap-major. Serving converts it once when the
+    # layer is built, so the conversion stays outside the timed region.
+    conv_weight_tap_major = causal_conv1d_prepare_weight(conv_weight)
 
     # context: seq_len sub-sweep; generation: single token per request.
     seq_iter = seq_len_list if phase == "context" else [1]
@@ -189,13 +206,6 @@ def _run_phase(
     for batch_size in batch_size_list:
         for seq_len in seq_iter:
             num_tokens = batch_size * seq_len
-            if phase == "context" and seq_len % _CTX_SEQ_MULTIPLE:
-                # Xe3p prefill conv rejects sequence lengths not divisible by 64;
-                # skip the whole cell (conv + scan) rather than measure half of it.
-                print(
-                    f"GDN {phase} skip {model_name} bs={batch_size} seq={seq_len} (seq_len % {_CTX_SEQ_MULTIPLE} != 0)"
-                )
-                continue
             if phase == "context" and num_tokens * conv_dim >= _CONV_ELEM_LIMIT:
                 # packed conv input has num_tokens*conv_dim elements; past 2**31 the
                 # allocation balloons to tens of GB and stalls the device (NV raises
@@ -222,36 +232,32 @@ def _run_phase(
             state_indices = torch.arange(1, batch_size + 1, dtype=torch.int32, device=device)
 
             if phase == "context":
-                # Conv: packed-QKV depthwise conv over the prompt. vLLM layout:
-                # feature-contiguous [conv_dim, tokens] input, paged conv-state
-                # cache with unit channel stride.
-                conv_x = torch.randn(num_tokens, conv_dim, dtype=dtype, device=device).transpose(0, 1)
-                conv_states = torch.zeros(batch_size + 1, taps, conv_dim, dtype=dtype, device=device).transpose(-1, -2)
+                # Conv: packed-QKV depthwise conv over the prompt. Token-major
+                # [tokens, conv_dim] activations (the projection output feeds
+                # the kernel without a transpose) and a paged conv-state cache
+                # in vLLM's SD layout [slots, taps, conv_dim].
+                conv_x = torch.randn(num_tokens, conv_dim, dtype=dtype, device=device)
+                conv_states = torch.zeros(batch_size + 1, taps, conv_dim, dtype=dtype, device=device)
                 has_initial_state = torch.zeros(batch_size, dtype=torch.bool, device=device)
                 query_start_loc = torch.arange(0, num_tokens + 1, seq_len, dtype=torch.int32, device=device)
 
-                # q and k occupy key_dim, so conv q-heads mirror the k-heads;
-                # l2norm is left to the scan to avoid double-normalizing.
+                # Plain depthwise conv + SiLU, as the CUDA collector times it:
+                # the Q/K/V split and the Q/K L2 norm are not part of this op.
                 def run_conv(_x=conv_x, _st=conv_states, _qsl=query_start_loc, _has=has_initial_state):
-                    causal_conv1d_fn(
+                    causal_conv1d_varlen(
                         _x,
-                        conv_weight,
-                        None,
-                        "silu",
-                        _st,
-                        state_indices,
-                        _has,
+                        conv_weight_tap_major,
                         _qsl,
-                        apply_qkv_split=True,
-                        num_q_heads=num_k_heads,
-                        num_k_heads=num_k_heads,
-                        num_v_heads=num_v_heads,
-                        head_q_dim=head_k_dim,
-                        head_k_dim=head_k_dim,
-                        head_v_dim=head_v_dim,
-                        apply_l2norm=False,
+                        conv_states=_st,
+                        cache_indices=state_indices,
+                        has_initial_state=_has,
+                        bias=None,
+                        activation="silu",
                     )
 
+                # Row label stays the CUDA kernel_source name: the SDK and the
+                # perf-reuse manifest key GDN conv rows on it, and this is the
+                # same op on the other vendor.
                 _benchmark(run_conv, device, common_log_data, "causal_conv1d_fn", perf_filename, phase=phase)
                 del conv_x, conv_states, has_initial_state, query_start_loc
                 gc.collect()
@@ -301,28 +307,21 @@ def _run_phase(
                 gc.collect()
                 get_device_module().empty_cache()
             else:
-                # Conv: single-token packed-QKV conv update against cached state.
+                # Conv: single-token packed-QKV conv update against cached
+                # state, SD layout [slots, taps, conv_dim] as in serving.
                 conv_x = torch.randn(batch_size, conv_dim, dtype=dtype, device=device)
-                conv_state = torch.randn(batch_size + 1, taps, conv_dim, dtype=dtype, device=device).transpose(-1, -2)
+                conv_state = torch.randn(batch_size + 1, taps, conv_dim, dtype=dtype, device=device)
 
-                # Xe3p decode conv runs only no-split (split update is rejected);
-                # the kernel processes the packed conv_dim channels directly.
+                # Plain depthwise conv + SiLU over the packed conv_dim channels,
+                # matching the CUDA causal_conv1d_update row (no split, no norm).
                 def run_conv(_x=conv_x, _st=conv_state):
-                    causal_conv1d_update(
+                    causal_conv1d_varlen_update(
                         _x,
                         _st,
-                        conv_weight,
-                        None,
-                        "silu",
-                        state_indices,
-                        apply_qkv_split=False,
-                        num_q_heads=num_k_heads,
-                        num_k_heads=num_k_heads,
-                        num_v_heads=num_v_heads,
-                        head_q_dim=head_k_dim,
-                        head_k_dim=head_k_dim,
-                        head_v_dim=head_v_dim,
-                        apply_l2norm=False,
+                        conv_weight_tap_major,
+                        conv_state_indices=state_indices,
+                        bias=None,
+                        activation="silu",
                     )
 
                 _benchmark(run_conv, device, common_log_data, "causal_conv1d_update", perf_filename, phase=phase)
