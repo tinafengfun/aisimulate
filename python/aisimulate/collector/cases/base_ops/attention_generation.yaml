@@ -309,10 +309,7 @@ framework_specific_op_cases:
         mha_query_head_counts: []
         xqa_query_head_counts:
         - 16
-        # - 64  # TODO(JIRA): re-enable once vllm-xpu-kernels compiles paged_decode
-        #        qgroup 16/32 @ hd256 (64h/4kv=r16, 64h/2kv=r32). Currently
-        #        uncompiled -> PyTorch ref fallback -> host .cpu() sync ->
-        #        UR_RESULT_ERROR_GRAPH_CAPTURE_UNSUPPORTED (error 72) under xpu graph.
+        - 64
         kv_head_counts:
         - 2
         - 4
@@ -325,9 +322,7 @@ framework_specific_op_cases:
           head_dim: 256
           window_size: 0
           mha_query_head_counts: []
-          # 64 temporarily disabled (r16/r32 paged_decode not compiled -> graph
-          # capture error 72). TODO(JIRA): restore [16, 64] after kernel rebuild.
-          xqa_query_head_counts: [16]
+          xqa_query_head_counts: [16, 64]
           kv_head_counts: [2, 4]
           allow_xqa_mha: true
           require_divisible: true
