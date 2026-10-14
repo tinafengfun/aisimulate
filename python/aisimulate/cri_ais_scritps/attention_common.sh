@@ -95,7 +95,7 @@ ais_att_env() {
     unset NEOReadDebugKeys OverrideL1CachePolicyInSurfaceStateAndStateless \
           LimitBlitterMaxHeight PostBlitCommand
     export VLLM_XPU_ENABLE_XPU_GRAPH=1
-    export AIC_DSV4_PACK_TARGET_MS=0        # pack off = CUDA baseline method
+    export AIC_DSV4_PACK_TARGET_MS=15      # pack to 15ms replays = CRI best-perf method (pack1=NV-parity mode)
     # MUST be explicit: this delivery tree reads SYCLTLA as ON when the var is
     # unset, which inflates the context memory estimate and pre-skips shapes
     # at case expansion (silently runs fewer cases than the campaign grid).
