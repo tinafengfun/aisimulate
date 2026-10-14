@@ -20,12 +20,19 @@ from collector.case_generator import get_gemm_case_specs, get_gemm_type_specs
 from collector.helper import benchmark_with_power, get_device_module, log_perf, xpu_graph_measure_enabled
 from collector.vllm.utils_xpu import create_vllm_config, setup_distributed, with_exit_stack
 from vllm.config import set_current_vllm_config
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.linear import RowParallelLinear
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kFp8Dynamic128Sym,
+    kFp8StaticTensorSym,
+)
 from vllm.utils.deep_gemm import per_block_cast_to_fp8
 from vllm.version import __version__ as vllm_version
 
 FP8_BLOCK_SHAPE = (128, 128)
+FP8_E4M3_MAX = 448.0
 
 # Max device-memory fraction for packed op copies.
 _LOOP_MEM_BUDGET_FRACTION_BY_SYSTEM = {
@@ -99,9 +106,9 @@ def _gemm_peak_footprint_bytes(gemm_type: str, m: int, n: int, k: int, copies: i
     per_copy = (n * k + m * n) * 2
     footprint = input_bytes + per_copy * max(copies, 0)
     if gemm_type == "fp8_block":
-        footprint += n * k * 4
+        footprint += n * k * 4 + m * k
     elif gemm_type == "fp8":
-        footprint += n * k
+        footprint += n * k + m * k
     return footprint
 
 
@@ -154,10 +161,38 @@ def run_gemm(exit_stack, gemm_type, m, n, k, *, perf_filename, device="xpu:0"):
 
     x = torch.randn((m, k), dtype=dtype, device=torch.device(device))
 
+    fp8_input_scale = None
+    if gemm_type == "fp8":
+        fp8_input_scale = torch.full(
+            (1,),
+            max(float(x.abs().max()), 1e-12) / FP8_E4M3_MAX,
+            dtype=torch.float32,
+            device=torch.device(device),
+        )
+        x = QuantizedActivation(
+            data=(x.to(torch.float32) / fp8_input_scale)
+            .clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+            .to(torch.float8_e4m3fn),
+            scale=fp8_input_scale,
+            orig_dtype=dtype,
+            orig_shape=x.shape,
+            quant_key=kFp8StaticTensorSym,
+        )
+    elif gemm_type == "fp8_block":
+        # Same workaround, per-token-group activation scales.
+        q_data, q_scale = per_token_group_quant_fp8(x, FP8_BLOCK_SHAPE[1], use_ue8m0=False)
+        x = QuantizedActivation(
+            data=q_data,
+            scale=q_scale,
+            orig_dtype=dtype,
+            orig_shape=x.shape,
+            quant_key=kFp8Dynamic128Sym,
+        )
+
     if gemm_type == "fp8":
         qc = Fp8Config(
-            is_checkpoint_fp8_serialized=False,  # dynamic quant after creation
-            activation_scheme="dynamic",
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="static",
             ignored_layers=None,
             weight_block_size=None,
         )
@@ -213,14 +248,30 @@ def run_gemm(exit_stack, gemm_type, m, n, k, *, perf_filename, device="xpu:0"):
                 gemm.to(torch.device(device))
             except NotImplementedError:
                 gemm = gemm.to_empty(device=torch.device(device))
-                with torch.no_grad():
-                    for param in gemm.parameters():
-                        if param.dtype.is_floating_point:
-                            param.normal_()
-                        else:
-                            param.zero_()
+
+            # Both paths leave params uninitialized, so always fill: zeros on
+            # fresh pages, stale garbage (incl. NaN) on recycled ones. normal_()
+            # has no XPU kernel for fp8/fp4, so those params are left to the
+            # per-gemm_type blocks below, which set them explicitly.
+            with torch.no_grad():
+                for param in gemm.parameters():
+                    if param.dtype in (torch.float32, torch.float64, torch.float16, torch.bfloat16):
+                        param.normal_()
+                    elif not param.dtype.is_floating_point:
+                        param.zero_()
 
             if gemm_type in ("fp8", "mxfp4", "mxfp8") and hasattr(gemm, "weight"):
+                if gemm_type == "fp8":
+                    # workaround dynamic quant poor perf problem for activation
+                    # by directly passing in fp8 activation and scale.
+                    with torch.no_grad():
+                        gemm.weight.copy_(
+                            torch.randn(gemm.weight.shape, dtype=torch.float32, device=device)
+                            .clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+                            .to(gemm.weight.dtype)
+                        )
+                        gemm.weight_scale.fill_(1.0)
+                        gemm.input_scale.copy_(fp8_input_scale)
                 # Quantize the weights in place after creation.
                 if hasattr(gemm, "quant_method") and gemm.quant_method is not None:
                     quant_method = gemm.quant_method
