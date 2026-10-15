@@ -8,4 +8,4 @@ ais_parse_args "$@"
 
 ais_run VLLM_XPU_ENABLE_XPU_GRAPH=1 \
     "${PYTHON}" "${COLLECT_PY}" \
-    --backend vllm --ops gemm --gpu cri --keep-csv "${AIS_SMOKE_ARGS[@]}" "${EXTRA_ARGS[@]}"
+    --backend vllm --ops gemm --gpu cri --case-filter bfloat16 --case-filter mxfp8 --case-filter mxfp4 --keep-csv "${AIS_SMOKE_ARGS[@]}" "${EXTRA_ARGS[@]}"
