@@ -23,6 +23,17 @@ whereas the varlen pair takes every shape in the sweep. The fused path is what
 vLLM-XPU serving calls (``vllm/_xpu_ops.py``); its extra split+norm cost is a
 model-level concern, not part of this op's cross-vendor row.
 
+The prefill scan row L2-normalizes q/k before the timed closure and always
+calls ``chunk_gated_delta_rule`` with ``use_qk_l2norm_in_kernel=False``,
+mirroring the NVIDIA collector exactly (it normalizes q/k outside its own
+timed region and passes the same ``False``). DeepKLOX's Xe2 backend only
+implements ``False`` for this flag; its Xe3p backend implements both and
+defaults production serving to ``True``, timing the norm in-kernel. Forcing
+``False`` here on Xe3p too drops that in-kernel norm cost from the row, the
+same production-fidelity-for-comparability tradeoff as the conv rows above.
+Decode's ``gated_delta_rule_decode`` is left at ``use_qk_l2norm=True`` on both
+collectors (no tradeoff there: both already time the norm in-kernel).
+
 The primitives are imported from vLLM-XPU's ``mamba.gdn.deepklox_interface``,
 which dispatches each op to DeepKLOX for now.
 """
@@ -275,8 +286,24 @@ def _run_phase(
 
                 # Scan: chunked gated-delta-rule. q/k span head_k_dim, v spans
                 # head_v_dim; g/beta are already exp/sigmoid-space per v-head.
-                q = torch.randn(num_tokens, num_k_heads, head_k_dim, dtype=dtype, device=device)
-                k = torch.randn(num_tokens, num_k_heads, head_k_dim, dtype=dtype, device=device)
+                # q/k are L2-normalized here, outside the timed region, and
+                # the kernel is always called with use_qk_l2norm_in_kernel=False
+                # -- matching the CUDA collector, which normalizes q/k before
+                # entering its own timed closure and also passes False
+                # (NV collect_gdn.py's run_gdn_context_benchmark). DeepKLOX's
+                # Xe2 backend only implements False (raises on True); Xe3p
+                # implements both and defaults to True in production, but its
+                # in-kernel norm cost would otherwise be timed on XPU and not
+                # on CUDA, overstating the cross-vendor gap by work the CUDA
+                # row never does. Forcing False here trades Xe3p's production
+                # fidelity for CUDA-comparable accounting, same tradeoff as
+                # the conv rows' varlen-vs-fused choice above.
+                q = torch.nn.functional.normalize(
+                    torch.randn(num_tokens, num_k_heads, head_k_dim, dtype=dtype, device=device), dim=-1
+                )
+                k = torch.nn.functional.normalize(
+                    torch.randn(num_tokens, num_k_heads, head_k_dim, dtype=dtype, device=device), dim=-1
+                )
                 v = torch.randn(num_tokens, num_v_heads, head_v_dim, dtype=dtype, device=device)
                 g = (0.8 + 0.2 * torch.rand(num_tokens, num_v_heads, device=device)).float()
                 beta = torch.sigmoid(torch.randn(num_tokens, num_v_heads, device=device)).float()
@@ -292,7 +319,7 @@ def _run_phase(
                         scale=scale,
                         cu_seqlens=_cu,
                         output_final_state=True,
-                        use_qk_l2norm_in_kernel=backend == "xe3p",
+                        use_qk_l2norm_in_kernel=False,
                     )
 
                 _benchmark(
