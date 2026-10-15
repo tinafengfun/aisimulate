@@ -317,12 +317,23 @@ framework_specific_op_cases:
         - 256
         window_sizes:
         - 0
+        # Only the (16, 2) and (64, 4) query/kv pairs are run; separate
+        # single-pair profiles avoid head_profiles' query x kv cross product,
+        # which would also generate the unwanted (16, 4) and (64, 2) pairs.
         head_profiles:
-        - id: default_head256
+        - id: default_head256_q16_kv2
           head_dim: 256
           window_size: 0
           mha_query_head_counts: []
-          xqa_query_head_counts: [16, 64]
-          kv_head_counts: [2, 4]
+          xqa_query_head_counts: [16]
+          kv_head_counts: [2]
+          allow_xqa_mha: true
+          require_divisible: true
+        - id: default_head256_q64_kv4
+          head_dim: 256
+          window_size: 0
+          mha_query_head_counts: []
+          xqa_query_head_counts: [64]
+          kv_head_counts: [4]
           allow_xqa_mha: true
           require_divisible: true
