@@ -129,10 +129,10 @@ def _decode_pack_n(state_bytes):
 
 
 def _benchmark(kernel_func, device, common_log_data, kernel_source, perf_filename, *, phase, state_bytes=0):
-    """Time one op and log a row. Context: eager, repeat_n=10 (NV parity). Generation: graph, pack_n per replay."""
-    use_graph = xpu_graph_measure_enabled() and phase != "context"
+    """Time one op and log a row. Context: graph, repeat_n=10 (NV parity). Generation: graph, pack_n per replay."""
+    use_graph = xpu_graph_measure_enabled()
 
-    if use_graph:
+    if use_graph and phase != "context":
         pack_n = _decode_pack_n(state_bytes)
         repeat_n = 1
 
@@ -140,7 +140,12 @@ def _benchmark(kernel_func, device, common_log_data, kernel_source, perf_filenam
             for _ in range(pack_n):
                 kernel_func()
     else:
-        # eager context: NV-style back-to-back amortization, no graph packing
+        # Context captures repeat_n=10 calls per replay, byte-for-byte the shape the
+        # NVIDIA collector measures: collect_gdn.py never passes use_cuda_graph, so
+        # helper.py's default of True applies there while it also passes repeat_n=10.
+        # Measuring context eager here instead charged CRI the per-call host enqueue
+        # cost (~20 us) that NV's capture removes, which is most of the small-shape gap.
+        # This branch still runs eager when XPU graphs are disabled entirely.
         pack_n = 1
         repeat_n = 10
         run = kernel_func
