@@ -181,6 +181,29 @@ def get_dsa_generation_module_test_cases():
     return get_xpu_mla_module_test_cases("generation")
 
 
+def _torch_cuda_alias_wrapper():
+    """Serving-faithful process-level ``torch.cuda → torch.xpu`` aliasing.
+
+    The XPU model runner installs these aliases in its ``__init__`` and never
+    restores them (leaky by design). GLM's DSA forward survives without them
+    on this wheel (sparse_attn_indexer.py:618 calls
+    torch.cuda.is_current_stream_capturing()), but serving parity says install
+    the wheel's own implementation rather than argue per-symbol — fail closed
+    if it stops being exported.
+    """
+    try:
+        from vllm.v1.worker.xpu_model_runner import _torch_cuda_wrapper
+    except ImportError as exc:
+        raise RuntimeError(
+            "vLLM XPU wheel does not export "
+            "vllm.v1.worker.xpu_model_runner._torch_cuda_wrapper; the collector "
+            "refuses to guess the torch.cuda→torch.xpu alias set (fail-closed). "
+            "Re-audit xpu_model_runner.py on this wheel and pin the alias list "
+            "explicitly if it was renamed."
+        ) from exc
+    return _torch_cuda_wrapper()
+
+
 def _init_dummy_module_tensors(module: torch.nn.Module) -> None:
     # Constant/zero data lowers switching power, so matrices are seeded-random
     # by default (seed 0); scales and 1D tensors keep the CUDA collector's
@@ -516,10 +539,14 @@ def run_mla_module(
     if gemm_type not in SUPPORTED_GEMM_TYPES:
         raise ValueError(f"unsupported vLLM XPU gemm_type={gemm_type!r}; supported={SUPPORTED_GEMM_TYPES}")
 
-    setup_distributed(device)
-    get_device_module().set_device(device)
-    # DSA's sparse_attn_indexer requires a WorkspaceManager.
-    init_workspace_manager(torch.device(device))
+    # The alias wrapper is leaky (installed once per process, never restored),
+    # so wrapping init covers the worker's whole lifetime — same as the DSV4
+    # collector.
+    with _torch_cuda_alias_wrapper():
+        setup_distributed(device)
+        get_device_module().set_device(device)
+        # DSA's sparse_attn_indexer requires a WorkspaceManager.
+        init_workspace_manager(torch.device(device))
 
     is_context = "context" in perf_filename
     prefix_len = int(prefix_len) if is_context else 0
