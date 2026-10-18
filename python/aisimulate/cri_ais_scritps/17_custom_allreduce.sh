@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
+# vLLM custom allreduce (graph/eager, per world size) with per-group retry.
 set -euo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
+source "$(dirname -- "${BASH_SOURCE[0]}")/comm_group_lib.sh"
 
 AIS_GPU_DEFAULT=
 export CCL_SELECTION_POLICY="$(pwd)/cri_ce+chunking_policy.json"
@@ -8,11 +10,16 @@ export CCL_SELECTION_POLICY="$(pwd)/cri_ce+chunking_policy.json"
 AIS_GPU_HELP="comma-separated GPU ids to run the collectives on, e.g. 0,1,2,3"
 ais_parse_args "$@"
 
-# collect_comm.sh has no case limit: it derives the world sizes from
-# torch.xpu.device_count(). Smoke = expose two GPUs so only tp=2 runs.
-if [[ "${AIS_SMOKE}" = 1 && -z "${ZE_AFFINITY_MASK:-}" ]]; then
-    export ZE_AFFINITY_MASK=0,1
-    echo ">>> smoke: ZE_AFFINITY_MASK=${ZE_AFFINITY_MASK} (tp=2 only)"
-fi
+# unset ZE_AFFINITY_MASK
+echo ">>> execution: ZE_AFFINITY_MASK=${ZE_AFFINITY_MASK:-<all>}"
+retry_init custom_allreduce_perf.txt
 
-ais_run VLLM_XPU_ENABLE_XPU_GRAPH=1 bash "${COLLECT_COMM}" --device xpu --skip-nccl "${EXTRA_ARGS[@]}"
+run_all_groups() {
+    gpu_sizes || return $?
+    run_custom_groups
+    finish_groups
+}
+
+echo ">>> cmd: cd $(printf '%q' "${ROOT}") && run_all_groups (retries=${RETRIES}, timeout=${ATTEMPT_TIMEOUT}s)" | tee -a "${AIS_LOG}"
+run_all_groups 2>&1 | tee -a "${AIS_LOG}"
+exit "${PIPESTATUS[0]}"

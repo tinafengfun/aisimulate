@@ -42,7 +42,7 @@ SINGLE_GPU=(01_gemm.sh 02_fa_attention_context.sh 03_fa_attention_generation.sh
             06_gdn.sh 07_moe.sh 14_mhc.sh 15_16_wideep_moe.sh
             12_13_hca_context_generation.sh 26_27_swa_context_generation.sh
             04_05_mla_attention.sh 10_11_csa_attention.sh)
-COMM=(17_custom_allreduce.sh 18_nccl.sh)
+COMM=(17_custom_allreduce.sh 18_oneccl.sh)
 
 if [[ ${#SELECTED[@]} -gt 0 ]]; then
     TARGETS=("${SELECTED[@]}")
