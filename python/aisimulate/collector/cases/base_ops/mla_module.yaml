@@ -69,19 +69,15 @@ common_case_values:
       num_heads:
         - 64
       # fp8 kv-cache not yet supported by XPU MLA Sparse backend; using bf16 kv.
+      # fp8_block projections have no XPU serving path; mxfp8 is the online
+      # MXFP8 shorthand (--quantization mxfp8, dynamic quant of bf16 weights).
       precision_combos:
         - compute_dtype: bfloat16
           kv_cache_dtype: bfloat16
           gemm_type: bfloat16
         - compute_dtype: bfloat16
           kv_cache_dtype: bfloat16
-          gemm_type: fp8_block
-        # - compute_dtype: bfloat16
-        #   kv_cache_dtype: fp8
-        #   gemm_type: bfloat16
-        # - compute_dtype: bfloat16
-        #   kv_cache_dtype: fp8
-        #   gemm_type: fp8_block
+          gemm_type: mxfp8
       context:
         batch_sizes:
           - 1
