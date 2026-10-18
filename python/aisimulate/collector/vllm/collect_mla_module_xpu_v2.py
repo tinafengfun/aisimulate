@@ -128,9 +128,52 @@ def _resolve_model_path(model_name: str) -> str:
     return tmp_dir
 
 
+def _context_activation_footprint_bytes(total_tokens: int, num_heads: int) -> int:
+    """Lower bound of a context case's peak transient activation set.
+
+    The module forward coexists (at least partially): concatenated q
+    [tokens, heads, 576], q_b_proj out [.., 256], kv_b_proj out [.., 448],
+    sparse-attn out [.., 512] and the o_proj input [.., 256] — 2048 bf16
+    elements per token per head. Weights/KV cache/workspace are excluded so
+    the estimate is a lower bound on the forward's transient demand.
+    Validated on the 160 GB CRI part: the boundary matches measurement
+    exactly — b*s = 614,400 (b=8, s=76800) DEVICE_LOSTs, b*s = 409,600
+    (b=4, s=102400) passes (2026-10-18 grid run).
+    """
+    return total_tokens * num_heads * (576 + 256 + 448 + 512 + 256) * 2
+
+
+def _filter_context_cases_by_memory(cases: list) -> list:
+    """Drop context cases whose activation lower bound exceeds the device budget.
+
+    The one sanctioned in-collector filter (layer_permissions.md): generation
+    time only, size-vs-capacity predicate, drops counted in the log — never a
+    runtime skip. Capacity is queried live; no device (case-expansion dry run
+    off-GPU) means no filter.
+    """
+    try:
+        total_memory = get_device_module().get_device_properties(0).total_memory
+    except Exception:
+        return cases
+    budget = int(total_memory * 0.9)
+    kept, dropped = [], 0
+    for case in cases:
+        seq_len, batch_size, num_heads = case[0], case[1], case[2]
+        if _context_activation_footprint_bytes(seq_len * batch_size, num_heads) > budget:
+            dropped += 1
+            continue
+        kept.append(case)
+    if dropped:
+        print(
+            f"dsa_context_module: dropped {dropped}/{len(cases)} cases "
+            f"(memory budget, device={total_memory / 2**30:.0f}GiB)"
+        )
+    return kept
+
+
 def get_dsa_context_module_test_cases():
     """collect.py entrypoint for DSA context module collection (XPU)."""
-    return get_xpu_mla_module_test_cases("context")
+    return _filter_context_cases_by_memory(get_xpu_mla_module_test_cases("context"))
 
 
 def get_dsa_generation_module_test_cases():
