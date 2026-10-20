@@ -149,9 +149,12 @@ if [[ "${MODE}" = "full" ]]; then
     local_ops=()
     for n in "${AIS_ATT_CASES[@]}"; do local_ops+=("${AIS_ATT_CASE_OP[$n]}"); done
     ais_att_assert_case_counts "${local_ops[@]}"
-    AIS_ATT_FLAGS=(--backend vllm --gpu cri --keep-csv --resume --resume-retry-failed)
+    # No --keep-csv: the v2 collector's product is the finalized parquet
+    # (perf.txt -> parquet + collection_meta.yaml at the output root);
+    # --keep-csv keeps the staging CSVs and SKIPS parquet finalization.
+    AIS_ATT_FLAGS=(--backend vllm --gpu cri --resume --resume-retry-failed)
 else
-    AIS_ATT_FLAGS=(--backend vllm --gpu cri --smoke --keep-csv)
+    AIS_ATT_FLAGS=(--backend vllm --gpu cri --smoke)
 fi
 
 echo ">>> mode=${MODE} cases: ${AIS_ATT_CASES[*]}"
