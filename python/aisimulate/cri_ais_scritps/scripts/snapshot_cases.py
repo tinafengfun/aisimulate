@@ -81,6 +81,13 @@ def main() -> int:
     parser.add_argument("--commit", type=str, default="",
                         help="source commit override — required when the sync target is not a git "
                              "checkout (e.g. container /workspace); record the local repo HEAD here")
+    parser.add_argument("--set-yaml", action="append", default=[],
+                        metavar="REPO_REL_PATH=LOCAL_FILE",
+                        help="inject a local campaign yaml over the snapshot copy AFTER copying "
+                             "(repeatable). The provenance sha256 is computed on the injected "
+                             "content and the override is recorded under `overrides` — the "
+                             "snapshot stays self-describing. Use this to pin the campaign yaml "
+                             "without touching the repo tree (iso mode).")
     args = parser.parse_args()
 
     repo = args.repo.resolve()
@@ -107,6 +114,25 @@ def main() -> int:
         target.write_bytes(path.read_bytes())
         copied[str(CASES_REL / rel)] = sha256_file(path)
 
+    overrides: dict[str, str] = {}
+    for spec in args.set_yaml:
+        rel_path, _, local = spec.partition("=")
+        if not rel_path or not local:
+            print(f"ERROR: --set-yaml expects REPO_REL_PATH=LOCAL_FILE, got '{spec}'", file=sys.stderr)
+            return 2
+        target = out / rel_path  # rel_path is repo-relative; CASES_REL is already in it
+        src_file = Path(local)
+        if not src_file.is_file():
+            print(f"ERROR: --set-yaml source file not found: {local}", file=sys.stderr)
+            return 2
+        if not target.is_file():
+            print(f"ERROR: --set-yaml target not in snapshot: {rel_path}", file=sys.stderr)
+            return 2
+        target.write_bytes(src_file.read_bytes())
+        provenance_rel = rel_path
+        copied[provenance_rel] = sha256_file(target)
+        overrides[provenance_rel] = str(src_file.resolve())
+
     commit, dirty = git_commit(repo)
     if args.commit:
         commit, dirty = args.commit, False
@@ -119,6 +145,7 @@ def main() -> int:
         "previous_provenance_archived_to": archived,
         "file_count": len(copied),
         "files_sha256": copied,
+        "overrides": overrides,
         "pin_env": f"AIC_COLLECTOR_CASES_ROOT={out}",
     }
     (out / PROVENANCE_NAME).write_text(yaml.safe_dump(provenance, sort_keys=False))

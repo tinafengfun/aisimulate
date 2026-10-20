@@ -507,17 +507,7 @@ def create_and_prepopulate_kv_cache_mla(
     inv_perm = torch.zeros(blocks_end, dtype=torch.long, device=device)
     inv_perm[1:] = torch.argsort(perm) + 1  # Add 1 to account for starting from block 1
 
-    # Workaround for XPU FP8 indexing not implemented:
-    # Intel Extension for PyTorch (IPEX) currently lacks support for advanced
-    # indexing (slicing via LongTensor) on Float8 tensors ("index_xpu" not implemented).
-    # To bypass this, we temporarily cast the KV cache to bfloat16, perform the
-    # permutation, and then cast it back to the original FP8 format.
-    if "xpu" in str(device) and kv_cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        temp_cache = kv_cache.to(torch.bfloat16)
-        temp_cache_sliced = temp_cache[perm, ...]
-        kv_cache[1:blocks_end, ...] = temp_cache_sliced.to(kv_cache.dtype)
-    else:
-        kv_cache[1:blocks_end, ...] = kv_cache[perm, ...]
+    kv_cache[1:blocks_end, ...] = kv_cache[perm, ...]
 
     # Construct the right block table
     # Start from block_id=1 since block_id=0 is considered the null block
@@ -610,17 +600,7 @@ def create_and_prepopulate_kv_cache(
     # Add 1 to account for starting from block 1
     inv_perm[1:] = torch.argsort(perm) + 1
 
-    # Workaround for XPU FP8 indexing not implemented:
-    # Intel Extension for PyTorch (IPEX) currently lacks support for advanced
-    # indexing (slicing via LongTensor) on Float8 tensors ("index_xpu" not implemented).
-    # To bypass this, we temporarily cast the KV cache to bfloat16, perform the
-    # permutation, and then cast it back to the original FP8 format.
-    if "xpu" in str(device) and kv_cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        temp_cache = kv_cache.to(torch.bfloat16)
-        temp_cache_sliced = temp_cache[:, perm, ...]
-        kv_cache[:, 1:blocks_end, ...] = temp_cache_sliced.to(kv_cache.dtype)
-    else:
-        kv_cache[:, 1:blocks_end, ...] = kv_cache[:, perm, ...]
+    kv_cache[:, 1:blocks_end, ...] = kv_cache[:, perm, ...]
 
     # Construct the right block table
     # Start from block_id=1 since block_id=0 is considered the null block

@@ -35,7 +35,12 @@ try:
 except ImportError:
     from vllm.utils.torch_utils import is_torch_equal_or_newer
 
-from vllm.v1.attention.backends.utils import set_kv_cache_layout
+try:
+    # vLLM <=0.27 exposed a process-global layout override here. 0.28 removed it
+    # in favour of CacheConfig.kv_cache_layout; see _force_kv_cache_layout.
+    from vllm.v1.attention.backends.utils import set_kv_cache_layout
+except ImportError:
+    set_kv_cache_layout = None  # type: ignore[assignment]
 from vllm.version import __version__ as vllm_version
 
 try:
@@ -95,6 +100,56 @@ def _get_backend_kv_cache_stride_order(backend_cls, ndim: int) -> tuple[int, ...
     return tuple(get_stride_order())
 
 
+def _backend_required_kv_cache_layout(backend_cls) -> str | None:
+    """Physical KV cache layout the backend needs, across vLLM's two spellings.
+
+    vLLM <=0.27 exposed ``get_required_kv_cache_layout()`` returning a single
+    layout name. 0.28 replaced it with ``supported_kv_cache_layouts()``, which
+    returns ``KVCacheLayout`` members most-preferred-first or ``None`` when any
+    layout works; resolution then takes ``candidates[0]``
+    (vllm/v1/attention/backends/utils.py:204-218,318 @0.28.0.dev0). Taking the
+    first entry therefore reproduces the layout serving would pick.
+    """
+    supported = getattr(backend_cls, "supported_kv_cache_layouts", None)
+    if supported is not None:
+        layouts = supported()
+        if not layouts:
+            return None
+        first = layouts[0]
+        return getattr(first, "name", first)
+    legacy = getattr(backend_cls, "get_required_kv_cache_layout", None)
+    if legacy is not None:
+        return legacy()
+    return None
+
+
+def _force_kv_cache_layout(exit_stack, vllm_config, layout_name: str) -> None:
+    """Pin the physical KV cache layout for one collected case, then restore it.
+
+    0.28 dropped the ``set_kv_cache_layout`` process-global override. The layout
+    now lives on ``CacheConfig.kv_cache_layout``, and pre-setting it is the
+    sanctioned path for exactly this situation: "Tests and standalone tools may
+    pre-set a value, which resolution then honors as-is"
+    (vllm/config/cache.py:80-90 @0.28.0.dev0). The legacy ``NHD``/``HND`` names
+    remain valid as aliases of ``LBNHC``/``LBHNC``
+    (vllm/config/cache.py:21-24 @0.28.0.dev0).
+    """
+    cache_config = getattr(vllm_config, "cache_config", None)
+    if cache_config is not None and hasattr(cache_config, "kv_cache_layout"):
+        previous = cache_config.kv_cache_layout
+        cache_config.kv_cache_layout = layout_name
+        exit_stack.callback(setattr, cache_config, "kv_cache_layout", previous)
+        return
+    if set_kv_cache_layout is None:
+        raise RuntimeError(
+            f"vLLM {vllm_version} exposes neither CacheConfig.kv_cache_layout nor "
+            "set_kv_cache_layout, so the collector cannot pin the KV cache layout "
+            f"{layout_name!r} that this backend requires."
+        )
+    set_kv_cache_layout(layout_name)
+    exit_stack.callback(set_kv_cache_layout, None)
+
+
 # KV footprint above which the ~38us graph-replay launch is <~5% -> pack_n=1.
 _LAUNCH_AMORTIZE_BYTES = 340_000_000
 
@@ -139,6 +194,36 @@ def run_attention_torch(
     dtype = torch.bfloat16
     model = os.path.join(os.path.dirname(__file__), "fake_hf_model")
     block_size = 64
+
+    # fp8 attn: enable the XPU FlashAttention backend's fp8-query input.
+    #
+    # attn_dtype="fp8" means *full* fp8 -- an fp8_e4m3 query AND an fp8 KV cache --
+    # as opposed to "bfloat16" + use_fp8_kv_cache (bf16 Q, fp8 KV). On XPU the
+    # FLASH_ATTN backend routes to vllm._xpu_ops.flash_attn_varlen_func, a thin
+    # pass-through to vllm_xpu_kernels.flash_attn_interface.flash_attn_varlen_func
+    # -- the exact entry point the standalone kernel sweep benchmarks, so these
+    # rows stay comparable with it (including head_dim=256, which that sweep
+    # measures successfully).
+    #
+    # FlashAttentionImpl only forwards q_descale when supports_quant_query_input
+    # is set, and on XPU that is gated by the VLLM_XPU_SUPPORT_FP8_QUERY env var,
+    # which defaults to 0. The flag is read per impl construction and vllm.envs is
+    # uncached here (no engine service is started), so scoping it to fp8 cases is
+    # both necessary and sufficient -- leaving it on globally would also attach a
+    # descale to the bf16 rows.
+    #
+    # Deliberately NOT the XPU_ATTN backend: it hard-requires DeepKLOX, whose
+    # full-fp8 prefill is compiled for head_dim=128 only ("Full fp8 XE3 prefill
+    # only supports head dimension 128, got 256"), and it is a different kernel
+    # library from the one the sweep measures.
+    if attn_dtype == "fp8":
+        _prev_fp8_q = os.environ.get("VLLM_XPU_SUPPORT_FP8_QUERY")
+        os.environ["VLLM_XPU_SUPPORT_FP8_QUERY"] = "1"
+        exit_stack.callback(
+            lambda: os.environ.__setitem__("VLLM_XPU_SUPPORT_FP8_QUERY", _prev_fp8_q)
+            if _prev_fp8_q is not None
+            else os.environ.pop("VLLM_XPU_SUPPORT_FP8_QUERY", None)
+        )
 
     # Let vLLM choose the backend. Handle multiple historical signatures:
     # newest: (... use_mm_prefix=..., use_v1=True/False defaulted to True)
@@ -215,6 +300,17 @@ def run_attention_torch(
         backend_name = LegacyBackendEnum[backend_name_str]
     else:
         backend_name = backend_name_str
+
+    # Fail loudly rather than silently mislabelling. fp8 needs a backend that
+    # forwards an fp8 query plus q_descale; XPU_ATTN would route to DeepKLOX,
+    # a different kernel library whose full-fp8 prefill is head_dim=128 only.
+    if attn_dtype == "fp8" and backend_name_str not in ("FLASH_ATTN", "FLASHINFER"):
+        raise RuntimeError(
+            f"attn_dtype='fp8' expects the FLASH_ATTN backend (it forwards an fp8 "
+            f"query and q_descale to vllm_xpu_kernels, the library the standalone "
+            f"sweep measures); vLLM resolved '{backend_name_str}' instead. Refusing "
+            f"to produce a row that is not comparable with the kernel sweep."
+        )
 
     if is_context_phase:
         batch_spec = BatchSpec(
@@ -306,13 +402,11 @@ def run_attention_torch(
         # packed logical view into kernel inputs shaped [num_blocks,
         # block_size, num_kv_heads, head_size]. Keep vLLM's backend-selected
         # physical stride order so those kernel views match serving.
-        get_required_layout = getattr(backend_cls, "get_required_kv_cache_layout", None)
-        if get_required_layout is not None:
-            set_kv_cache_layout(get_required_layout())
-            exit_stack.callback(set_kv_cache_layout, None)
-        elif backend_name_str == "FLASHINFER":
-            set_kv_cache_layout("HND")
-            exit_stack.callback(set_kv_cache_layout, None)
+        required_layout = _backend_required_kv_cache_layout(backend_cls)
+        if required_layout is None and backend_name_str == "FLASHINFER":
+            required_layout = "HND"
+        if required_layout is not None:
+            _force_kv_cache_layout(exit_stack, vllm_config, required_layout)
         stride_order = _get_backend_kv_cache_stride_order(backend_cls, 4)
         kv_cache = _pack_v1_fa_kv_cache(kv_cache, stride_order)
 
@@ -386,8 +480,18 @@ def run_attention_torch(
         sinks=sinks,
     )
 
-    # fp8 attn: set a static Q descale (amax/448) so the kernel quantizes the
-    # bf16 query to fp8 internally. Latency is scale-invariant.
+    # fp8 attn: layer._q_scale is the per-tensor descale (amax/448) that
+    # FlashAttentionImpl forwards to the kernel as q_descale. Latency is
+    # scale-invariant, so the exact value only matters for numerics.
+    #
+    # HISTORY: setting a scale alone used to be a no-op. flash_attn.py forwards
+    # layer._q_scale as q_descale but never converts the query tensor, and the
+    # conversion below was explicitly skipped on XPU, so the "fp8" rows were
+    # really bf16-Q + fp8-KV. Cross-checked against the standalone kernel sweep
+    # over 258 shapes, attn_dtype="fp8" and attn_dtype="bfloat16"+fp8-KV were
+    # numerically identical (median ratio 0.9999) and both sat ~7x SLOWER than
+    # bf16 -- the fp8kv signature, not an fp8 one. Any context_attention_perf.txt
+    # rows with attn_dtype="fp8" written before this change are invalid.
     if attn_dtype == "fp8":
         amax = query_vllm.detach().abs().max().to(torch.float32)
         q_scale = float((amax / 448.0).clamp(min=1e-4))
@@ -401,10 +505,26 @@ def run_attention_torch(
     test_ite = int(os.getenv("AIC_ATTN_NUM_RUNS", "6"))
     warm_up = int(os.getenv("AIC_ATTN_WARMUP", "3"))
 
-    # XPU's FlashAttention implementation currently expects Query and Output
-    # to be bfloat16 even if the KV Cache is FP8.
-    # TODO: Remove the code if FP8 support will not be in the roadmap.
-    if "xpu" not in str(device) and use_fp8_kv_cache and backend_name_str in ("FLASH_ATTN", "FLASHINFER"):
+    # Hand the kernel a genuinely fp8 query. The output never follows the query
+    # dtype -- fp8 Q yields a 16-bit output -- so the buffer is re-typed too.
+    #
+    # Previously this was gated on `"xpu" not in str(device)`, i.e. disabled on
+    # the very platform being measured, on the grounds that "XPU's FlashAttention
+    # expects Query and Output to be bfloat16". That holds for bf16-Q + fp8-KV
+    # (attn_dtype="bfloat16", use_fp8_kv_cache=True), which is why the condition
+    # is now keyed on attn_dtype rather than on the KV cache dtype.
+    if attn_dtype == "fp8" and backend_name_str in ("FLASH_ATTN", "FLASHINFER"):
+        if not impl.supports_quant_query_input:
+            raise RuntimeError(
+                "attn_dtype='fp8' requires an fp8 query, but "
+                f"{backend_name_str} reports supports_quant_query_input=False, so "
+                "q_descale would be dropped. On XPU this flag comes from "
+                "VLLM_XPU_SUPPORT_FP8_QUERY; refusing to record a mislabelled row."
+            )
+        query_vllm = query_vllm.to(current_platform.fp8_dtype())
+        output = output.to(torch.bfloat16)
+    elif use_fp8_kv_cache and "xpu" not in str(device) and backend_name_str in ("FLASH_ATTN", "FLASHINFER"):
+        # Non-XPU devices want an fp8 query whenever the KV cache is fp8.
         query_vllm = query_vllm.to(current_platform.fp8_dtype())
         output = output.to(torch.bfloat16)
 
@@ -547,10 +667,17 @@ def _max_gqa_ratio():
 # (attn_compute_dtype, use_fp8_kv_cache) combos swept per system/phase. fp8 Q
 # compute on XPU requires an fp8 KV cache (the kernel couples them), so attn=fp8
 # only pairs with kv=fp8; attn=fp8/kv=bf16 is intentionally omitted. B60's kernel
-# is bf16-compute only. Generation is bf16 compute on every system.
+# is bf16-compute only, so it stays bf16 in both phases.
+#
+# CRI runs fp8 in generation too. The win is context-dependent, which is what
+# tells it apart from a mislabelled duplicate of the fp8-KV row: fp8/bf16 sits
+# at 0.94 for step<=127, falls through 0.79 at 255 and 0.67 at 511, and settles
+# near 0.6 beyond 4095 -- short contexts are launch-bound, long ones are KV
+# bandwidth-bound. Past ~8191 fp8 and fp8-KV converge to within 2% because a
+# single token's Q conversion is negligible against the KV stream.
 _ATTN_DTYPE_KV_COMBOS = {
     ("cri", "context"): [("bfloat16", False), ("bfloat16", True), ("fp8", True)],
-    ("cri", "generation"): [("bfloat16", False), ("bfloat16", True)],
+    ("cri", "generation"): [("bfloat16", False), ("bfloat16", True), ("fp8", True)],
 }
 _DEFAULT_ATTN_DTYPE_KV_COMBOS = [("bfloat16", False), ("bfloat16", True)]
 

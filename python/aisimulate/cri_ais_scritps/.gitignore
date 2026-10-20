@@ -1,0 +1,8 @@
+# Collector output lands in whatever directory these scripts are run from.
+*_perf.txt
+*_perf.parquet
+collector.log
+collector_errors.log
+
+# Timestamped per-run output directories (e.g. gemm_20261012_062509/).
+*_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]/

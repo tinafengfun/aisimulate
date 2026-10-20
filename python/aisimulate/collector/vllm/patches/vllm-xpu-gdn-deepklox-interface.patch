@@ -1,0 +1,125 @@
+From 2c7f524a419223b3a03c420c38b9b3b606fa03a0 Mon Sep 17 00:00:00 2001
+From: "Zhang, Yanli L" <yanli.l.zhang@intel.com>
+Date: Mon, 12 Oct 2026 07:23:08 +0000
+Subject: [PATCH] feat(gdn/xpu): expose the DeepKLOX GDN kernels
+
+_resolve_gdn_prefill_backend returns "triton" on every non-CUDA platform,
+so the XPU GDN kernels in DeepKLOX had no import path and callers that
+want them -- the AIS collector benchmarks each GDN op in isolation --
+failed with ModuleNotFoundError.
+
+Forward both conv families, the two scan primitives, the one-off
+causal_conv1d_prepare_weight, and gdn_prefill_backend(), which reports
+xe3p/xe2 via DeepKLOX's own is_xe3p_arch/is_xe2_arch probes, the same
+ones its C++ dispatch calls, so the reported backend always names the
+kernel the call reaches.
+
+Both conv families are needed because they are different kernels, not
+two spellings of one. causal_conv1d_varlen / causal_conv1d_varlen_update
+are the plain depthwise causal conv + activation, matching what the CUDA
+GDN layers call (mamba/ops/causal_conv1d.py), so a caller can time or
+run the same op on both vendors. causal_conv1d_fn / causal_conv1d_update
+additionally fuse the Q/K/V split and the Q/K L2 norm; that is the pair
+vllm/_xpu_ops.py drives in serving. Their support surfaces differ too:
+on Xe3p the fused prefill kernel requires apply_qkv_split=True and
+sequence lengths divisible by 64, and the fused decode kernel rejects
+both the split and the norm, while the varlen pair takes every shape.
+
+Forwarding only: DeepKLOX keeps validation and dispatch, so the two
+cannot drift. DeepKLOX is optional, hence the explicit ImportError and
+no package-scope import.
+
+Verified on GPU0 (Xe3p) through the AIS GDN collector: 436 rows, 0
+errors, conv rows on the varlen pair and the scan labelled
+chunk_gated_delta_rule_xe3p.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../layers/mamba/gdn/deepklox_interface.py    | 74 +++++++++++++++++++
+ 1 file changed, 74 insertions(+)
+ create mode 100644 vllm/model_executor/layers/mamba/gdn/deepklox_interface.py
+
+diff --git a/vllm/model_executor/layers/mamba/gdn/deepklox_interface.py b/vllm/model_executor/layers/mamba/gdn/deepklox_interface.py
+new file mode 100644
+index 0000000000..1a98a704f7
+--- /dev/null
++++ b/vllm/model_executor/layers/mamba/gdn/deepklox_interface.py
+@@ -0,0 +1,74 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GDN primitives backed by DeepKLOX (XPU).
++
++The in-tree GDN layers reach their prefill scan through
++``_resolve_gdn_prefill_backend``, which returns ``"triton"`` on every
++non-CUDA platform (``qwen_gdn_linear_attn.py``). On XPU the kernels that
++actually run live in DeepKLOX, so this module exposes them under stable
++names for callers that want the XPU path explicitly -- currently the
++AIS collector, which benchmarks each GDN op in isolation:
++
++* context: ``causal_conv1d_varlen`` + ``chunk_gated_delta_rule``
++* generation: ``causal_conv1d_varlen_update`` + ``gated_delta_rule_decode``
++
++Both conv families are forwarded. The ``*_varlen*`` pair is the plain
++depthwise causal conv + activation, which is what the CUDA GDN layers
++call (``mamba/ops/causal_conv1d.py``); ``causal_conv1d_fn`` /
++``causal_conv1d_update`` are the XPU-only variants that additionally fuse
++the Q/K/V split and the Q/K L2 norm. They are separate kernels with
++different support surfaces, so both names stay exposed and the caller
++picks.
++
++This is a forwarding layer and deliberately nothing more. DeepKLOX owns
++argument validation, dtype/layout checks and the architecture dispatch,
++so re-implementing any of it here would let the two drift apart. DeepKLOX
++is an optional dependency; importing this module without it raises, which
++is why nothing imports it at package scope.
++"""
++
++from vllm.utils.import_utils import has_deepklox
++
++if not has_deepklox():
++    raise ImportError(
++        "vllm.model_executor.layers.mamba.gdn.deepklox_interface needs the "
++        "optional `deepklox` package, which provides the XPU GDN kernels."
++    )
++
++from deepklox import (  # noqa: E402
++    causal_conv1d_fn,
++    causal_conv1d_prepare_weight,
++    causal_conv1d_update,
++    causal_conv1d_varlen,
++    causal_conv1d_varlen_update,
++    chunk_gated_delta_rule,
++    gated_delta_rule_decode,
++)
++from deepklox.gdn_interface import _prefill_backend  # noqa: E402
++
++
++def gdn_prefill_backend(device=None) -> str | None:
++    """Name the prefill-scan specialization this device dispatches to.
++
++    Returns ``"xe3p"``, ``"xe2"``, or ``None`` when the architecture cannot
++    be resolved (no XPU, or a build without the Xe3p kernels). DeepKLOX
++    probes it through the same ``is_xe3p_arch``/``is_xe2_arch`` helpers its
++    C++ dispatch calls, so the answer always names the kernel the call will
++    reach rather than a guess from the device name.
++
++    ``device=None`` means the current XPU device, as it does for tensor
++    allocation and for the C++ dispatch itself.
++    """
++    return _prefill_backend(device)
++
++
++__all__ = [
++    "causal_conv1d_fn",
++    "causal_conv1d_prepare_weight",
++    "causal_conv1d_update",
++    "causal_conv1d_varlen",
++    "causal_conv1d_varlen_update",
++    "chunk_gated_delta_rule",
++    "gated_delta_rule_decode",
++    "gdn_prefill_backend",
++]
+base-commit: e3e075508d506a721093dcd0aa94ac2e32811fda
+-- 
+2.43.0
+

@@ -1496,7 +1496,7 @@ def get_moe_backend_test_cases(backend: str) -> list[MoeCommonTestCase]:
 
 @dataclasses.dataclass
 class MoeEpXpuTestCase:
-    """One (model, ep) large-EP MoE expert-compute case for the vLLM-XPU collector."""
+    """One (model, ep, quant mode) large-EP MoE expert-compute case for the vLLM-XPU collector."""
 
     hidden_size: int
     inter_size: int
@@ -1504,6 +1504,7 @@ class MoeEpXpuTestCase:
     num_experts: int
     ep: int
     model_name: str
+    moe_dtype: str
     context_token_counts: list[int]  # GLOBAL tokens (per-rank * ep)
     generation_token_counts: list[int]  # GLOBAL tokens (per-rank * ep)
     token_expert_distributions: list[tuple[str, Optional[float]]]
@@ -1514,9 +1515,10 @@ def get_xpu_moe_ep_test_cases(backend: str = "vllm_xpu_cri") -> list[MoeEpXpuTes
     Large-EP MoE expert-compute cases for the vLLM-XPU (CRI) ``moe_ep`` collector.
 
     ``common_case_values.moe_ep`` holds the sweep policy only: EP sizes,
-    per-phase GLOBAL token counts, token-expert distributions, and a
-    ``model_paths`` allowlist. Model dimensions come from the ``backend`` MoE
-    model rows (``framework_cases.<backend>`` or
+    per-phase GLOBAL token counts, token-expert distributions, a
+    ``quantization_modes`` list, and a ``model_paths`` allowlist. Model
+    dimensions come from the ``backend`` MoE model rows
+    (``framework_cases.<backend>`` or
     ``framework_specific_model_case_values.<backend>``); allowlist entries match
     by path or alias. moe_tp_size is fixed at 1. EP sizes that do not evenly
     shard a model's experts are skipped. An allowlisted model with no
@@ -1533,6 +1535,7 @@ def get_xpu_moe_ep_test_cases(backend: str = "vllm_xpu_cri") -> list[MoeEpXpuTes
     )
     ep_list = _as_int_list(sweep.get("expert_parallel_sizes"), field_name="moe_ep.expert_parallel_sizes")
     token_distributions = _moe_token_expert_distributions(sweep)
+    quant_modes = _as_str_list(sweep.get("quantization_modes"), field_name="moe_ep.quantization_modes")
 
     model_paths = _as_str_list(sweep.get("model_paths"), field_name="moe_ep.model_paths")
 
@@ -1555,19 +1558,23 @@ def get_xpu_moe_ep_test_cases(backend: str = "vllm_xpu_cri") -> list[MoeEpXpuTes
         for ep in ep_list:
             if ep > num_experts or num_experts % ep != 0:
                 continue
-            test_cases.append(
-                MoeEpXpuTestCase(
-                    hidden_size=int(model_config["hidden_size"]),
-                    inter_size=int(model_config["inter_size"]),
-                    topk=int(model_config["topk"]),
-                    num_experts=num_experts,
-                    ep=ep,
-                    model_name=model_path,
-                    context_token_counts=context_token_counts,
-                    generation_token_counts=generation_token_counts,
-                    token_expert_distributions=token_distributions,
+            for moe_dtype in quant_modes:
+                if not moe_model_allows_quantization(backend, model_path, moe_dtype):
+                    continue
+                test_cases.append(
+                    MoeEpXpuTestCase(
+                        hidden_size=int(model_config["hidden_size"]),
+                        inter_size=int(model_config["inter_size"]),
+                        topk=int(model_config["topk"]),
+                        num_experts=num_experts,
+                        ep=ep,
+                        model_name=model_path,
+                        moe_dtype=moe_dtype,
+                        context_token_counts=context_token_counts,
+                        generation_token_counts=generation_token_counts,
+                        token_expert_distributions=token_distributions,
+                    )
                 )
-            )
     return test_cases
 
 

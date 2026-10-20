@@ -45,7 +45,9 @@ ais_usage() {
 Usage: $(basename "$0") [-d <gpu>] [-o <dir>] [-s] [extra args passed to the collector]
 
   -d, --device <gpu>  ${AIS_GPU_HELP:-GPU id to run on} (default: ${AIS_GPU_DEFAULT:-all})
-  -o, --outdir <dir>  where the *_perf.txt land (default: ${AIS_RESULTS_DIR})
+  -o, --outdir <dir>  parent dir; this run's own <script>_<timestamp>/
+                      subdir (log + *_perf.txt) lands inside it
+                      (default parent: ${AIS_RESULTS_DIR})
   -s, --smoke         sample a few cases per op instead of the full sweep
   -h, --help          show this help
 
@@ -93,15 +95,23 @@ ais_parse_args() {
     echo ">>> $(basename "$0"): ZE_AFFINITY_MASK=${ZE_AFFINITY_MASK:-<all>}${smoke_note}"
 
     # collect.py / collect_comm.sh write *_perf.txt into the cwd and offer no
-    # output-directory flag, so pin the cwd instead.
-    mkdir -p "${AIS_RESULTS_DIR}" || {
-        echo "ERROR: cannot create results dir '${AIS_RESULTS_DIR}'" >&2; exit 2
+    # output-directory flag, so pin the cwd instead. Every invocation gets its
+    # own <script-basename>_<timestamp>/ subdir under AIS_RESULTS_DIR (the -o
+    # value, or this dir by default) so the run's log and *_perf.txt always
+    # land together, under a name you can tell apart from any other script's
+    # or any other run's output at a glance.
+    local run_ts run_dir
+    run_ts="$(date +%Y%m%d_%H%M%S)"
+    run_dir="${AIS_RESULTS_DIR%/}/$(basename "$0" .sh)_${run_ts}"
+    mkdir -p "${run_dir}" || {
+        echo "ERROR: cannot create results dir '${run_dir}'" >&2; exit 2
     }
+    AIS_RESULTS_DIR="${run_dir}"
     cd "${AIS_RESULTS_DIR}" || exit 2
     echo ">>> results -> $(pwd)"
 
     if [[ -z "${AIS_LOG:-}" ]]; then
-        AIS_LOG="$(pwd)/$(basename "$0" .sh)_$(date +%Y%m%d_%H%M%S).log"
+        AIS_LOG="$(pwd)/$(basename "$0" .sh)_${run_ts}.log"
     fi
     echo ">>> log -> ${AIS_LOG}"
 }

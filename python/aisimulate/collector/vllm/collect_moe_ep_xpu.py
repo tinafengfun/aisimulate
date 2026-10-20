@@ -19,6 +19,13 @@ dimensions come from the models' ``vllm_xpu_cri`` MoE rows. Token counts are
 GLOBAL (the persisted ``num_tokens`` key, = per-rank * ep) and are benchmarked
 as-is.
 
+Quantization: ``fp8_block`` (128x128 block-scaled) and ``mxfp8`` (per-32
+e8m0 block-scaled) -- both pass fp8_e4m3fn weights/activations to
+``XpuFusedMoe``, identical byte-per-element footprint, only the quant
+recipe/scale granularity differs (see ``collect_moe_xpu.py``'s
+``create_fp8_block_weights_xpu``/``create_mxfp8_weights_xpu`` and
+``quant_fp8_block_act``/``quant_mxfp_act_xpu``, reused here unchanged).
+
 Differences from the CUDA bench, all mirroring vLLM's DeepEP high-throughput
 serving path into ``XPUExperts`` (``fused_moe/experts/xpu_moe.py``):
 
@@ -69,11 +76,14 @@ from collector.helper import (
     power_law_deepep_prefill,
     xpu_graph_measure_enabled,
 )
-from collector.vllm.collect_moe_xpu import create_fp8_block_weights_xpu, resolve_moe_activation
+from collector.vllm.collect_moe_xpu import (
+    create_fp8_block_weights_xpu,
+    create_mxfp8_weights_xpu,
+    resolve_moe_activation,
+)
 from collector.wideep.vllm.collect_moe_ep import (
     MOE_EP_KERNEL_SOURCE,
     MOE_EP_OP_NAME,
-    MOE_EP_QUANT_MODE,
     MoeEpBenchmarkError,
     _build_moe_ep_row,
     _moe_expert_compute_perf_path,
@@ -81,9 +91,16 @@ from collector.wideep.vllm.collect_moe_ep import (
 )
 from vllm.version import __version__ as vllm_version
 from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
-from vllm_xpu_kernels.moe_utils import quant_fp8_block_act
+from vllm_xpu_kernels.moe_utils import quant_fp8_block_act, quant_mxfp_act_xpu
 
 _DISTRIBUTIONS = ("uniform", "power_law")
+
+# moe_dtype values this XPU collector can benchmark. Both are fp8_e4m3fn
+# weights/activations through the same XpuFusedMoe path (see the module
+# docstring); the set is declared here (not imported from the dormant CUDA
+# ``collect_moe_ep.py``, whose ``MOE_EP_QUANT_MODE`` stays fp8_block-only)
+# because XPU support is independent of the CUDA collector's coverage.
+_SUPPORTED_QUANT_MODES = ("fp8_block", "mxfp8")
 
 # Fraction of device memory the estimated per-launch intermediates may use.
 # Headroom covers weights, allocator slack and the second buffer set an
@@ -113,7 +130,7 @@ def get_moe_ep_test_cases():
             case.topk,
             case.num_experts,
             case.num_experts,  # num_slots: no EPLB redundancy axis on vllm
-            MOE_EP_QUANT_MODE,
+            case.moe_dtype,
             case.model_name,
             case.context_token_counts,
             case.generation_token_counts,
@@ -142,12 +159,17 @@ def _make_xpu_fused_moe_bench(
     topk: int,
     num_experts: int,
     model_name: str,
+    moe_dtype: str,
     device,
 ):
     """Build the ``bench(phase, global_num_tokens, distributed, alpha)`` callable for one case."""
-    # [E, N, K] fp8 + [E, N/128, K/128] scales, passed as-is (the CRI image's
-    # XpuFusedMoe takes this layout for block-FP8; see the module docstring).
-    w13, w2, w13_scales, w2_scales, local_num_experts, padded_hidden = create_fp8_block_weights_xpu(
+    # [E, N, K] fp8_e4m3fn weights for both modes, passed as-is (the CRI
+    # image's XpuFusedMoe takes this layout for block-FP8); only the scale
+    # tensor granularity differs -- [E, N/128, K/128] for fp8_block vs
+    # per-32 e8m0 scales for mxfp8 (see the module docstring).
+    is_mxfp8 = moe_dtype == "mxfp8"
+    weight_builder = create_mxfp8_weights_xpu if is_mxfp8 else create_fp8_block_weights_xpu
+    w13, w2, w13_scales, w2_scales, local_num_experts, padded_hidden = weight_builder(
         num_experts, hidden_size, inter_size, 1, moe_ep_size, device
     )
     if local_num_experts != num_local_experts:
@@ -242,7 +264,10 @@ def _make_xpu_fused_moe_bench(
             )
         hidden_states = torch.randn(max_recv_tokens, padded_hidden, dtype=torch.bfloat16, device=device)
         # Xe3P serving quantizes in prepare (before dispatch), so outside the timed region.
-        act_hidden_states, a1q_scale = quant_fp8_block_act(hidden_states)
+        if is_mxfp8:
+            act_hidden_states, a1q_scale = quant_mxfp_act_xpu(hidden_states, "mxfp8")
+        else:
+            act_hidden_states, a1q_scale = quant_fp8_block_act(hidden_states)
         del hidden_states
         outputs = [
             torch.empty(topk_ids.shape[0], padded_hidden, dtype=torch.bfloat16, device=device) for topk_ids, _ in draws
@@ -299,9 +324,9 @@ def run_moe_ep_torch(
     parameters. The only skips are printed memory-budget pre-skips and
     OOM'd series, which are raised at the end of the case.
     """
-    if moe_dtype != MOE_EP_QUANT_MODE:
+    if moe_dtype not in _SUPPORTED_QUANT_MODES:
         raise MoeEpBenchmarkError(
-            f"moe_ep[vllm_xpu] benchmarks {MOE_EP_QUANT_MODE!r} only; case declared moe_dtype={moe_dtype!r}"
+            f"moe_ep[vllm_xpu] benchmarks {_SUPPORTED_QUANT_MODES!r} only; case declared moe_dtype={moe_dtype!r}"
         )
     device = torch.device(device)
     get_device_module().set_device(device)
@@ -319,6 +344,7 @@ def run_moe_ep_torch(
             topk=topk,
             num_experts=num_experts,
             model_name=model_name,
+            moe_dtype=moe_dtype,
             device=device,
         )
 
@@ -363,7 +389,7 @@ def run_moe_ep_torch(
                     f"moe_ep_size={moe_ep_size}, num_experts={num_experts}, model={model_name}): {e}"
                 ) from e
             row = _build_moe_ep_row(
-                moe_dtype=MOE_EP_QUANT_MODE,
+                moe_dtype=moe_dtype,
                 distribution=f"power_law_{power_law_alpha}" if distributed == "power_law" else distributed,
                 inference_phase=inference_phase,
                 num_tokens=global_num_tokens,
