@@ -124,7 +124,8 @@ ais_att_iso_snapshot() {
     # fail-loud: the override must be honored by the collector tree, else an
     # old tree silently reads the repo cases = fake isolation.
     grep -rq "AIC_COLLECTOR_CASES_ROOT" "${AIS_ROOT}/collector/case_generator.py" \
-        "${AIS_ROOT}/collector/capabilities.py" || {
+        "${AIS_ROOT}/collector/capabilities.py" "${AIS_ROOT}/collector/model_cases.py" \
+        "${AIS_ROOT}/collector/provenance.py" || {
         echo "ERROR: collector tree does not honor AIC_COLLECTOR_CASES_ROOT " \
              "(old tree; refusing to fake isolation)" >&2; exit 2; }
     "${PYTHON}" "${AIS_SCRIPT_DIR}/scripts/snapshot_cases.py" \
@@ -249,6 +250,7 @@ ais_att_run_case() {
     cd "$dir"
     {
         env | grep -E '^(ZE_AFFINITY_MASK|VLLM_XPU_ENABLE_XPU_GRAPH|AIC_DSV4_PACK_TARGET_MS|VLLM_XPU_MXFP8_USE_SYCLTLA)=' | sort
+        echo "AIC_COLLECTOR_CASES_ROOT=${AIC_COLLECTOR_CASES_ROOT:-<unset, repo cases>}"
         git -C "${AIS_ROOT}" rev-parse HEAD 2>/dev/null || true
     } > "run_env_${ts}.log"
     echo "===== CASE ${n} ${label} op=${op} dir=${dir} ====="

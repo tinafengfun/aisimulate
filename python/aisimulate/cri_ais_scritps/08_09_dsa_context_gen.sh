@@ -62,8 +62,9 @@ receives the real op name):
   -s, --smoke         sampled smoke grids (case-count gate skipped)
   -h, --help          this help
 
-Each case gets its own <label>_<YYYYMMDD_HHMMSS>/ results dir. The case yaml
-Each case gets its own <label>_<YYYYMMDD_HHMMSS>/ results dir. Case yaml runs from an isolated run-local snapshot (AIC_COLLECTOR_CASES_ROOT); the repo yaml is never touched.
+Each case gets its own <label>_<YYYYMMDD_HHMMSS>/ results dir. Case yaml runs
+from an isolated run-local snapshot (AIC_COLLECTOR_CASES_ROOT); the repo yaml
+is never touched.
 EOF
 }
 
