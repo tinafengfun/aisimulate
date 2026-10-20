@@ -15,7 +15,7 @@
 #   bash 08_09_dsa_context_gen.sh -h                 # help with the case table
 #
 # Each case runs in its own results dir <label>_<YYYYMMDD_HHMMSS>/ (run_env
-# log + perf.txt + parquet + collector logs, checkpoint isolated per case).
+# log + perf.txt + collector logs, checkpoint isolated per case).
 # Case yaml ISOLATION (run-local snapshot, iso mode): the repo yaml is never
 # touched. Each run generates <run_dir>/cases_snapshot/ via
 # scripts/snapshot_cases.py (with SNAPSHOT_PROVENANCE.yaml), injects
@@ -91,7 +91,7 @@ declare -A AIS_ATT_CASE_LABEL=(
     [09]=09_dsa_generation
 )
 # Campaign-pinned full-grid counts (glm53-v2-mxfp8 campaign yaml, verified in
-# the 2026-10-18 grid runs: 28/32 parquet rows on the 160GiB device).
+# the 2026-10-18 grid runs: 28/32 perf.txt rows on the 160GiB device).
 declare -A AIS_ATT_EXPECTED_COUNTS=(
     [dsa_context_module]=28
     [dsa_generation_module]=32
@@ -114,7 +114,8 @@ ais_glm_env() {
     export VLLM_XPU_ENABLE_XPU_GRAPH=1
     export AIC_MLA_MODULE_PACK_TARGET_MS="${AIC_MLA_MODULE_PACK_TARGET_MS:-15}"
     export AIC_MLA_MODULE_FLUSH_CACHE_MB="${AIC_MLA_MODULE_FLUSH_CACHE_MB:-0}"
-    export AIC_MLA_MODULE_DUMMY_DATA="${AIC_MLA_MODULE_DUMMY_DATA:-random}"
+    # DUMMY_DATA left unset: the v2 collector defaults to seeded-random
+    # (weights seed 0 / hidden seed 1 / KV seed 2), same spirit as 04_05.
     unset AIC_DSV4_PREFILL_TIMING AIC_DSV4_GRAPH_POLICY AIC_DSV4_PACK_TARGET_MS \
           VLLM_XPU_MXFP8_USE_SYCLTLA DEEPKLOX_SPARSE_PREFILL_DISABLE_FUSED \
           AIC_VLLM_DSV4_PREFILL_CHUNK_TOKENS AIC_VLLM_DSV4_SKIP_PREFILL_OVERFLOW \
@@ -158,12 +159,12 @@ if [[ "${MODE}" = "full" ]]; then
     local_ops=()
     for n in "${AIS_ATT_CASES[@]}"; do local_ops+=("${AIS_ATT_CASE_OP[$n]}"); done
     ais_att_assert_case_counts "${local_ops[@]}"
-    # No --keep-csv: the v2 collector's product is the finalized parquet
-    # (perf.txt -> parquet + collection_meta.yaml at the output root);
-    # --keep-csv keeps the staging CSVs and SKIPS parquet finalization.
-    AIS_ATT_FLAGS=(--backend vllm --gpu cri --resume --resume-retry-failed)
+    # --keep-csv: the v2 collector's staging perf.txt is the product (04_05
+    # product form); without it the collector finalizes to parquet and the
+    # staging txt is consumed into a hidden .retained file.
+    AIS_ATT_FLAGS=(--backend vllm --gpu cri --keep-csv --resume --resume-retry-failed)
 else
-    AIS_ATT_FLAGS=(--backend vllm --gpu cri --smoke)
+    AIS_ATT_FLAGS=(--backend vllm --gpu cri --smoke --keep-csv)
 fi
 
 echo ">>> mode=${MODE} cases: ${AIS_ATT_CASES[*]}"
