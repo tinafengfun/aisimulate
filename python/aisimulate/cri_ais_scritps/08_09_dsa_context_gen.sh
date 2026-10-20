@@ -16,17 +16,11 @@
 #
 # Each case runs in its own results dir <label>_<YYYYMMDD_HHMMSS>/ (run_env
 # log + perf.txt + collector logs, checkpoint isolated per case).
-# Case yaml ISOLATION (run-local snapshot, iso mode): the repo yaml is never
-# touched. Each run generates <run_dir>/cases_snapshot/ via
-# scripts/snapshot_cases.py (with SNAPSHOT_PROVENANCE.yaml), injects
-# test_yaml/mla_module.yaml over the snapshot's mla_module.yaml
-# (--set-yaml; provenance records the injected sha), and points
-# AIC_COLLECTOR_CASES_ROOT at the snapshot — all four consumers
-# (case_generator / capabilities / model_cases / provenance) honor the
-# override. A fail-loud guard aborts if the collector tree does not read
-# the override (old tree would silently ignore it = fake isolation).
-# Concurrent runs of this and other scripts (04/05 mla) sharing
-# mla_module.yaml cannot pollute each other; SIGKILL leaves no residue.
+# Case yaml DEPLOY (ww42 legacy style): test_yaml/mla_module.yaml is backed
+# up once (.pristine-bak), deployed over collector/cases/base_ops/
+# mla_module.yaml for the run, and restored on exit — including Ctrl+C
+# (SIGINT/SIGTERM) and errors. Not restored on SIGKILL/power loss
+# (documented limit); restore is idempotent and verified by sha256.
 #
 # Startup gates: full mode asserts the expanded case grid equals the
 # campaign-pinned counts (08: 28 / 09: 32) before any GPU work; GPU 4 is
@@ -62,9 +56,8 @@ receives the real op name):
   -s, --smoke         sampled smoke grids (case-count gate skipped)
   -h, --help          this help
 
-Each case gets its own <label>_<YYYYMMDD_HHMMSS>/ results dir. Case yaml runs
-from an isolated run-local snapshot (AIC_COLLECTOR_CASES_ROOT); the repo yaml
-is never touched.
+Each case gets its own <label>_<YYYYMMDD_HHMMSS>/ results dir. The case yaml
+is restored on exit, including Ctrl+C and errors (not on SIGKILL).
 EOF
 }
 
@@ -98,8 +91,9 @@ declare -A AIS_ATT_EXPECTED_COUNTS=(
 )
 
 TEST_YAML="${AIS_SCRIPT_DIR}/test_yaml/mla_module.yaml"
-# iso mode: no repo-yaml deploy/restore, so the EXIT yaml cleanup is not
-# wired; INT/TERM traps stay (they stop the collector child precisely).
+REPO_YAML="${AIS_ROOT}/collector/cases/base_ops/mla_module.yaml"
+AIS_ATT_REPO_YAML="${REPO_YAML}"
+trap ais_att_cleanup EXIT
 trap 'ais_att_on_signal 130' INT
 trap 'ais_att_on_signal 143' TERM
 
@@ -125,9 +119,9 @@ ais_glm_env() {
 }
 ais_glm_env
 
-# iso isolation: run-local case snapshot + AIC_COLLECTOR_CASES_ROOT override
-# (shared helper; test_yaml/mla_module.yaml is this script's campaign yaml).
-ais_att_iso_snapshot "${TEST_YAML}" "collector/cases/base_ops/mla_module.yaml" "glm53-08_09"
+# yaml deploy: test yaml over the repo copy (ww42 legacy style); restored on
+# exit via ais_att_cleanup (EXIT trap).
+ais_att_yaml_deploy "${TEST_YAML}" "${REPO_YAML}"
 
 # Per-case results dir + run_env log + run (modeled on ais_att_run_case; the
 # run_env log captures the GLM-5.3 env contract instead of the DSV4 one).
@@ -172,4 +166,5 @@ for n in "${AIS_ATT_CASES[@]}"; do
     ais_glm_run_case "$n"
 done
 
+ais_att_yaml_restore "${REPO_YAML}"
 echo "GLM_CASES_DONE mode=${MODE} cases=${AIS_ATT_CASES[*]} run_dir=$(pwd)"
