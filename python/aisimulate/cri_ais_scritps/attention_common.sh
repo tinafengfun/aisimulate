@@ -11,6 +11,9 @@
 #   ais_att_parse_cases ALLOWED args...  -> AIS_ATT_CASES (case ids, ordered,
 #                                           deduped; no args = ALLOWED order)
 #   ais_att_env                          -> campaign env contract + GPU!=4 guard
+#   ais_att_iso_snapshot TEST REL TAG    -> run-local cases snapshot + yaml
+#                                           injection + AIC_COLLECTOR_CASES_ROOT
+#                                           (iso mode; repo yaml never touched)
 #   ais_att_yaml_deploy TEST REPO        -> backup-once + overwrite + sha verify
 #   ais_att_yaml_restore REPO            -> restore + sha evidence (idempotent)
 #   ais_att_assert_case_counts ops...    -> full-grid expansion == campaign pins
@@ -104,6 +107,35 @@ ais_att_env() {
           AIC_VLLM_DSV4_SKIP_PREFILL_OVERFLOW AIC_VLLM_DSV4_MAX_CUDAGRAPH_CAPTURE_SIZE \
           AIC_DSV4_PREFILL_TIMING AIC_DSV4_FLUSH_CACHE_MB AIC_VLLM_DSV4_MAX_MODEL_LEN
     export PYTHONPATH="${AIS_ROOT}${PYTHONPATH:+:$PYTHONPATH}"
+}
+
+# iso isolation (preferred): materialize a run-local cases snapshot and point
+# AIC_COLLECTOR_CASES_ROOT at it, injecting the script's own campaign yaml
+# over the snapshot copy. The collector's case-yaml contract is a full cases
+# TREE (base_ops + capabilities.yaml + denylist.yaml + models), so the env
+# var selects a root, not a single file — the snapshot (~1s) is how a per-
+# script test_yaml participates in it. Requires scripts/snapshot_cases.py
+# in this delivery package. Call AFTER ais_parse_args (run dir exists) and
+# the env contract; the count gate under the override then validates the
+# snapshot itself.
+ais_att_iso_snapshot() {
+    local test_yaml="$1" rel="$2" tag="$3" snap t r
+    snap="${AIS_RESULTS_DIR}/cases_snapshot"
+    # fail-loud: the override must be honored by the collector tree, else an
+    # old tree silently reads the repo cases = fake isolation.
+    grep -rq "AIC_COLLECTOR_CASES_ROOT" "${AIS_ROOT}/collector/case_generator.py" \
+        "${AIS_ROOT}/collector/capabilities.py" || {
+        echo "ERROR: collector tree does not honor AIC_COLLECTOR_CASES_ROOT " \
+             "(old tree; refusing to fake isolation)" >&2; exit 2; }
+    "${PYTHON}" "${AIS_SCRIPT_DIR}/scripts/snapshot_cases.py" \
+        --repo "${AIS_ROOT}" --out "${snap}" \
+        --tag "${tag}-$(TZ='Asia/Shanghai' date +%Y%m%d_%H%M%S)" \
+        --set-yaml "${rel}=${test_yaml}" || exit 2
+    t="$(sha256sum < "${test_yaml}" | cut -d' ' -f1)"
+    r="$(sha256sum < "${snap}/${rel}" | cut -d' ' -f1)"
+    [[ "$t" == "$r" ]] || { echo "ERROR: snapshot yaml injection mismatch" >&2; exit 2; }
+    export AIC_COLLECTOR_CASES_ROOT="${snap}"
+    echo ">>> case yaml isolated: AIC_COLLECTOR_CASES_ROOT=${snap}"
 }
 
 ais_att_yaml_deploy() {
