@@ -15,17 +15,16 @@
 #
 # Each case runs in its own results dir <label>_<YYYYMMDD_HHMMSS>/ (run_env
 # log + perf.txt + csv staging + collector logs, checkpoint isolated per
-# case). Case yaml ISOLATION (run-local snapshot, iso mode): the repo yaml is
-# never touched. Each run generates <run_dir>/cases_snapshot/ via
-# scripts/snapshot_cases.py and injects test_yaml/dsv4_attention.yaml over
-# the snapshot's dsv4_attention.yaml (--set-yaml; provenance records the
-# injected sha), then points AIC_COLLECTOR_CASES_ROOT at the snapshot —
-# all four consumers honor the override. Concurrent runs of the split
-# scripts sharing the repo yaml cannot pollute each other; SIGKILL leaves
-# no residue.
+# case). Case yaml DEPLOY (ww42 legacy style, unified with 08_09/10_11):
+# test_yaml/dsv4_attention.yaml is backed up once (.pristine-bak), deployed
+# over collector/cases/base_ops/dsv4_attention.yaml for the run, and restored
+# on exit — including Ctrl+C (SIGINT/SIGTERM) and errors. Not restored on
+# SIGKILL/power loss (documented limit); restore is idempotent and verified
+# by sha256. Do NOT run 04_05 and 10_11 concurrently: they deploy over the
+# same repo yaml (content is identical, but restore would race).
 #
 # Startup gates: full mode asserts the expanded case grid equals the
-# campaign-pinned counts (1274/1648/337/44) before any GPU work; GPU 4 is
+# campaign-pinned counts (337/44) before any GPU work; GPU 4 is
 # rejected (known segfault).
 set -euo pipefail
 
@@ -55,9 +54,8 @@ receives the real op name):
   -s, --smoke         sampled smoke grids (case-count gate skipped)
   -h, --help          this help
 
-Each case gets its own <label>_<YYYYMMDD_HHMMSS>/ results dir. Case yaml runs
-from an isolated run-local snapshot (AIC_COLLECTOR_CASES_ROOT); the repo yaml
-is never touched.
+Each case gets its own <label>_<YYYYMMDD_HHMMSS>/ results dir. The case yaml
+is restored on exit, including Ctrl+C and errors (not on SIGKILL).
 EOF
 }
 
@@ -74,16 +72,21 @@ USER_ARGS=("${EXTRA_ARGS[@]}")
 ais_att_parse_cases "04 05" "${USER_ARGS[@]}"
 
 TEST_YAML="${AIS_SCRIPT_DIR}/test_yaml/dsv4_attention.yaml"
-# iso mode: no repo-yaml deploy/restore, so the EXIT yaml cleanup is not
-# wired; INT/TERM traps stay (they stop the collector child precisely).
+REPO_YAML="${AIS_ROOT}/collector/cases/base_ops/dsv4_attention.yaml"
+AIS_ATT_REPO_YAML="${REPO_YAML}"
+# deploy/restore (ww42 style, same as 08_09/10_11): backup-once + overwrite,
+# restored on exit via ais_att_cleanup (EXIT trap covers SIGINT/SIGTERM and
+# errors; not SIGKILL).
+trap ais_att_cleanup EXIT
 trap 'ais_att_on_signal 130' INT
 trap 'ais_att_on_signal 143' TERM
 
 ais_att_env
 
-# iso isolation: run-local case snapshot + AIC_COLLECTOR_CASES_ROOT override
-# (shared helper; test_yaml/dsv4_attention.yaml is this script's campaign yaml).
-ais_att_iso_snapshot "${TEST_YAML}" "collector/cases/base_ops/dsv4_attention.yaml" "dsv4-$(basename "$0" .sh)"
+# yaml deploy: test yaml over the repo copy (ww42 legacy style); restored on
+# exit via ais_att_cleanup (EXIT trap). The count gate below runs under the
+# deployed yaml.
+ais_att_yaml_deploy "${TEST_YAML}" "${REPO_YAML}"
 
 MODE="full"
 [[ "${AIS_SMOKE}" = 1 ]] && MODE="smoke"
@@ -102,4 +105,5 @@ for n in "${AIS_ATT_CASES[@]}"; do
     ais_att_run_case "$n"
 done
 
+ais_att_yaml_restore "${REPO_YAML}"
 echo "ATT_CASES_DONE mode=${MODE} cases=${AIS_ATT_CASES[*]} run_dir=$(pwd)"
